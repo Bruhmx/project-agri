@@ -1,13 +1,12 @@
 # user_routes.py (import this in your main app.py)
 import json
-import mysql.connector
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 from flask import render_template, request, session, redirect, url_for, flash, jsonify, Response, make_response, \
     send_file
 
-from mysql.connector import IntegrityError
-
-from db_config import get_db
+from db_config import get_db, get_db_cursor, get_db_cursor_readonly
 from auth import hash_password, check_password, validate_email, validate_password, login_required
 import os
 from werkzeug.utils import secure_filename
@@ -72,35 +71,24 @@ def register_user_routes(app):
 
     def get_pending_count():
         """Get count of diagnoses pending review"""
-        db = None
-        cur = None
         try:
-            db = get_db()
-            cur = db.cursor(dictionary=True)
-
-            # FIXED: Use expert_review_status = 'pending'
-            cur.execute("""
-                SELECT COUNT(*) as count 
-                FROM diagnosis_history 
-                WHERE expert_review_status = 'pending' OR expert_review_status IS NULL
-            """)
-            result = cur.fetchone()
-            return result['count'] or 0
+            with get_db_cursor_readonly() as cur:
+                cur.execute("""
+                    SELECT COUNT(*) as count 
+                    FROM diagnosis_history 
+                    WHERE expert_review_status = 'pending' OR expert_review_status IS NULL
+                """)
+                result = cur.fetchone()
+                return result['count'] or 0
         except Exception as e:
             print(f"Error getting pending count: {e}")
             return 0
-        finally:
-            if cur: cur.close()
-            if db: db.close()
 
     # ========== AUTHENTICATION ROUTES ==========
 
     @app.route("/register", methods=["GET", "POST"])
     def register():
         """User registration"""
-        db = None
-        cur = None
-
         try:
             # If user is already logged in, redirect them
             if 'user_id' in session:
@@ -137,40 +125,43 @@ def register_user_routes(app):
                     flash('Invalid email address!', 'danger')
                     return render_template("register.html", redirect_to=redirect_after)
 
-                db = get_db()
-                cur = db.cursor(dictionary=True)
+                with get_db_cursor() as cur:
+                    # Check if user exists
+                    cur.execute("SELECT id FROM users WHERE username = %s OR email = %s",
+                                (username, email))
+                    if cur.fetchone():
+                        flash('Username or email already exists!', 'danger')
+                        return render_template("register.html", redirect_to=redirect_after)
 
-                # Check if user exists
-                cur.execute("SELECT id FROM users WHERE username = %s OR email = %s",
-                            (username, email))
-                if cur.fetchone():
-                    flash('Username or email already exists!', 'danger')
-                    return render_template("register.html", redirect_to=redirect_after)
-
-                # Create user
-                password_hash = hash_password(password)
-                cur.execute("""
-                    INSERT INTO users (username, email, password_hash, full_name, 
-                                      user_type, phone_number, location)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                """, (username, email, password_hash, full_name, user_type, phone, location))
-
-                user_id = cur.lastrowid
-
-                # Create default settings
-                cur.execute("""
-                    INSERT INTO user_settings (user_id) VALUES (%s)
-                """, (user_id,))
-
-                # Create subscription if newsletter is checked
-                newsletter = request.form.get('newsletter') == 'on'
-                if newsletter:
+                    # Create user
+                    password_hash = hash_password(password)
                     cur.execute("""
-                        INSERT INTO user_subscriptions (user_id, newsletter) 
-                        VALUES (%s, TRUE)
-                    """, (user_id,))
+                        INSERT INTO users (username, email, password_hash, full_name, 
+                                          user_type, phone_number, location, created_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+                        RETURNING id
+                    """, (username, email, password_hash, full_name, user_type, phone, location))
 
-                db.commit()
+                    user_id = cur.fetchone()['id']
+
+                    # Create default settings
+                    try:
+                        cur.execute("""
+                            INSERT INTO user_settings (user_id) VALUES (%s)
+                        """, (user_id,))
+                    except:
+                        pass  # Settings table might not exist
+
+                    # Create subscription if newsletter is checked
+                    newsletter = request.form.get('newsletter') == 'on'
+                    if newsletter:
+                        try:
+                            cur.execute("""
+                                INSERT INTO user_subscriptions (user_id, newsletter) 
+                                VALUES (%s, TRUE)
+                            """, (user_id,))
+                        except:
+                            pass  # Subscriptions table might not exist
 
                 # Auto-login after registration
                 session['user_id'] = user_id
@@ -190,19 +181,10 @@ def register_user_routes(app):
 
         except Exception as e:
             print(f"Registration error: {e}")
+            import traceback
+            traceback.print_exc()
             flash('Registration failed. Please try again.', 'danger')
             return render_template("register.html", redirect_to=redirect_to)
-        finally:
-            if cur:
-                try:
-                    cur.close()
-                except:
-                    pass
-            if db:
-                try:
-                    db.close()
-                except:
-                    pass
 
         # GET request - show registration form
         return render_template("register.html", redirect_to=redirect_to)
@@ -210,18 +192,15 @@ def register_user_routes(app):
     @app.route("/login", methods=["GET", "POST"])
     def login():
         """User login"""
-        db = None
-        cur = None
-
         try:
             # If already logged in, redirect based on role
             if 'user_id' in session:
                 if session.get('user_type') == 'admin':
                     print("🔄 Already logged in as admin, redirecting to admin dashboard")
-                    return redirect(url_for('admin_dashboard'))  # FIXED: no slash
+                    return redirect(url_for('admin_dashboard'))
                 elif session.get('user_type') == 'expert':
                     print("🔄 Already logged in as expert, redirecting to expert dashboard")
-                    return redirect(url_for('expert_dashboard'))  # FIXED: no slash
+                    return redirect(url_for('expert_dashboard'))
                 else:
                     return redirect(url_for('dashboard'))
 
@@ -233,18 +212,16 @@ def register_user_routes(app):
 
                 print(f"🔐 Login attempt for: {username}")
 
-                db = get_db()
-                cur = db.cursor(dictionary=True)
+                with get_db_cursor_readonly() as cur:
+                    # Get user
+                    cur.execute("""
+                        SELECT id, username, email, password_hash, user_type, 
+                               full_name, is_active, profile_image
+                        FROM users 
+                        WHERE username = %s OR email = %s
+                    """, (username, username))
 
-                # Get user
-                cur.execute("""
-                    SELECT id, username, email, password_hash, user_type, 
-                           full_name, is_active, profile_image
-                    FROM users 
-                    WHERE username = %s OR email = %s
-                """, (username, username))
-
-                user = cur.fetchone()
+                    user = cur.fetchone()
 
                 if user:
                     print(f"✅ User found: {user['username']}, Type: {user['user_type']}, Active: {user['is_active']}")
@@ -269,9 +246,8 @@ def register_user_routes(app):
                     print(f"✅ Session set: user_type={session['user_type']}")
 
                     # Update last login
-                    cur = db.cursor()
-                    cur.execute("UPDATE users SET last_login = NOW() WHERE id = %s", (user['id'],))
-                    db.commit()
+                    with get_db_cursor() as update_cur:
+                        update_cur.execute("UPDATE users SET last_login = NOW() WHERE id = %s", (user['id'],))
 
                     flash(f'Welcome back, {user["username"]}!', 'success')
 
@@ -292,11 +268,10 @@ def register_user_routes(app):
                     # 4. Role-based redirect
                     if user['user_type'] == 'admin':
                         print("🚀 Redirecting to ADMIN DASHBOARD")
-                        return redirect(url_for('admin_dashboard'))  # FIXED: no slash
+                        return redirect(url_for('admin_dashboard'))
                     elif user['user_type'] == 'expert':
                         print("🚀 Redirecting to EXPERT DASHBOARD")
-                        # You need to create this route if it doesn't exist
-                        return redirect(url_for('expert_dashboard'))  # FIXED: no slash
+                        return redirect(url_for('expert_dashboard'))
                     else:
                         print("🚀 Redirecting to FARMER DASHBOARD")
                         return redirect(url_for('dashboard'))
@@ -312,17 +287,6 @@ def register_user_routes(app):
             traceback.print_exc()
             flash('Login failed. Please try again.', 'danger')
             return render_template("login.html")
-        finally:
-            if cur:
-                try:
-                    cur.close()
-                except:
-                    pass
-            if db:
-                try:
-                    db.close()
-                except:
-                    pass
 
     @app.route("/logout")
     def logout():
@@ -338,65 +302,59 @@ def register_user_routes(app):
     def dashboard():
         """User dashboard"""
         user_id = session['user_id']
-        db = None
-        cur = None
 
         try:
-            db = get_db()
-            cur = db.cursor(dictionary=True)
-
-            # Get user stats
-            cur.execute("""
-                SELECT 
-                    COUNT(*) as total_diagnoses,
-                    COUNT(CASE WHEN DATE(created_at) = CURDATE() THEN 1 END) as today_diagnoses,
-                    AVG(confidence) as avg_confidence
-                FROM diagnosis_history 
-                WHERE user_id = %s
-            """, (user_id,))
-            stats = cur.fetchone()
-
-            if not stats:
-                stats = {'total_diagnoses': 0, 'today_diagnoses': 0, 'avg_confidence': 0}
-            else:
-                stats['avg_confidence'] = round(stats['avg_confidence'] or 0, 1)
-
-            # Get saved count - Note: This table might need updating too
-            # If you're not using saved_diagnoses anymore, you can remove this
-            try:
+            with get_db_cursor_readonly() as cur:
+                # Get user stats
                 cur.execute("""
-                    SELECT COUNT(*) as saved_count
-                    FROM saved_diagnoses 
+                    SELECT 
+                        COUNT(*) as total_diagnoses,
+                        COUNT(CASE WHEN DATE(created_at) = CURRENT_DATE THEN 1 END) as today_diagnoses,
+                        AVG(confidence) as avg_confidence
+                    FROM diagnosis_history 
                     WHERE user_id = %s
                 """, (user_id,))
-                saved_result = cur.fetchone()
-                saved_count = saved_result['saved_count'] if saved_result else 0
-            except:
-                # If saved_diagnoses table doesn't exist, just set to 0
-                saved_count = 0
-                print("Note: saved_diagnoses table doesn't exist")
+                stats = cur.fetchone()
 
-            # --- UPDATED: Get recent diagnoses WITHOUT image_path ---
-            cur.execute("""
-                SELECT id, crop, disease_detected, confidence, 
-                       created_at as diagnosis_date
-                FROM diagnosis_history 
-                WHERE user_id = %s 
-                ORDER BY created_at DESC 
-                LIMIT 5
-            """, (user_id,))
-            recent_diagnoses = cur.fetchall()
+                if not stats:
+                    stats = {'total_diagnoses': 0, 'today_diagnoses': 0, 'avg_confidence': 0}
+                else:
+                    stats['avg_confidence'] = round(stats['avg_confidence'] or 0, 1)
 
-            # Get top diseases
-            cur.execute("""
-                SELECT disease_detected, COUNT(*) as count
-                FROM diagnosis_history 
-                WHERE user_id = %s 
-                GROUP BY disease_detected 
-                ORDER BY count DESC 
-                LIMIT 5
-            """, (user_id,))
-            top_diseases = cur.fetchall()
+                # Get saved count
+                try:
+                    cur.execute("""
+                        SELECT COUNT(*) as saved_count
+                        FROM saved_diagnoses 
+                        WHERE user_id = %s
+                    """, (user_id,))
+                    saved_result = cur.fetchone()
+                    saved_count = saved_result['saved_count'] if saved_result else 0
+                except:
+                    saved_count = 0
+                    print("Note: saved_diagnoses table might not exist")
+
+                # Get recent diagnoses WITHOUT image_path
+                cur.execute("""
+                    SELECT id, crop, disease_detected, confidence, 
+                           created_at as diagnosis_date
+                    FROM diagnosis_history 
+                    WHERE user_id = %s 
+                    ORDER BY created_at DESC 
+                    LIMIT 5
+                """, (user_id,))
+                recent_diagnoses = cur.fetchall()
+
+                # Get top diseases
+                cur.execute("""
+                    SELECT disease_detected, COUNT(*) as count
+                    FROM diagnosis_history 
+                    WHERE user_id = %s 
+                    GROUP BY disease_detected 
+                    ORDER BY count DESC 
+                    LIMIT 5
+                """, (user_id,))
+                top_diseases = cur.fetchall()
 
             return render_template("dashboard.html",
                                    stats=stats,
@@ -410,123 +368,108 @@ def register_user_routes(app):
             traceback.print_exc()
             flash('Error loading dashboard', 'danger')
             return redirect(url_for('upload_image'))
-        finally:
-            if cur:
-                try:
-                    cur.close()
-                except:
-                    pass
-            if db:
-                try:
-                    db.close()
-                except:
-                    pass
 
     @app.route("/profile")
     @login_required
     def profile():
         """User profile page"""
         user_id = session['user_id']
-        db = None
-        cur = None
 
         try:
-            db = get_db()
-            cur = db.cursor(dictionary=True)
+            with get_db_cursor_readonly() as cur:
+                # Get user data
+                cur.execute("SELECT * FROM users WHERE id = %s", (user_id,))
+                user = cur.fetchone()
 
-            # Get user data
-            cur.execute("SELECT * FROM users WHERE id = %s", (user_id,))
-            user = cur.fetchone()
+                # Get stats
+                cur.execute("""
+                    SELECT 
+                        COUNT(*) as total_diagnosis,
+                        (SELECT COUNT(*) FROM saved_diagnoses WHERE user_id = %s) as saved_items,
+                        EXTRACT(DAY FROM NOW() - MIN(created_at)) as days_active
+                    FROM diagnosis_history 
+                    WHERE user_id = %s
+                """, (user_id, user_id))
+                stats = cur.fetchone()
 
-            # Get stats
-            cur.execute("""
-                SELECT 
-                    COUNT(*) as total_diagnosis,
-                    (SELECT COUNT(*) FROM saved_diagnoses WHERE user_id = %s) as saved_items,
-                    DATEDIFF(NOW(), MIN(created_at)) as days_active
-                FROM diagnosis_history 
-                WHERE user_id = %s
-            """, (user_id, user_id))
-            stats = cur.fetchone()
+                # Get recent activity
+                cur.execute("""
+                    (SELECT 
+                        'diagnosis' as type,
+                        CONCAT('Diagnosed ', disease_detected) as title,
+                        CONCAT('Crop: ', crop) as description,
+                        created_at as time,
+                        CONCAT('/history/', id) as link
+                    FROM diagnosis_history 
+                    WHERE user_id = %s)
+                    UNION ALL
+                    (SELECT 
+                        'save' as type,
+                        CONCAT('Saved ', disease_detected) as title,
+                        'Saved diagnosis for later' as description,
+                        sd.created_at as time,
+                        CONCAT('/history/', dh.id) as link
+                    FROM saved_diagnoses sd
+                    JOIN diagnosis_history dh ON sd.id = dh.id
+                    WHERE sd.user_id = %s)
+                    ORDER BY time DESC
+                    LIMIT 10
+                """, (user_id, user_id))
+                recent_activity = cur.fetchall()
 
-            # Get recent activity
-            cur.execute("""
-                (SELECT 
-                    'diagnosis' as type,
-                    CONCAT('Diagnosed ', disease_detected) as title,
-                    CONCAT('Crop: ', crop) as description,
-                    created_at as time,
-                    CONCAT('/history/', id) as link
-                FROM diagnosis_history 
-                WHERE user_id = %s)
-                UNION ALL
-                (SELECT 
-                    'save' as type,
-                    CONCAT('Saved ', disease_detected) as title,
-                    'Saved diagnosis for later' as description,
-                    sd.created_at as time,
-                    CONCAT('/history/', dh.id) as link
-                FROM saved_diagnoses sd
-                JOIN diagnosis_history dh ON sd.id = dh.id
-                WHERE sd.user_id = %s)
-                ORDER BY time DESC
-                LIMIT 10
-            """, (user_id, user_id))
-            recent_activity = cur.fetchall()
+                # Format time for display
+                for activity in recent_activity:
+                    if activity['time']:
+                        activity['time'] = activity['time'].strftime('%Y-%m-%d %H:%M') if hasattr(activity['time'], 'strftime') else str(activity['time'])
 
-            # Format time for display
-            for activity in recent_activity:
-                if activity['time']:
-                    activity['time'] = activity['time'].strftime('%Y-%m-%d %H:%M')
+                # Get crop expertise
+                cur.execute("""
+                    SELECT 
+                        crop as name,
+                        COUNT(*) as diagnosis_count,
+                        ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER(), 1) as percentage
+                    FROM diagnosis_history 
+                    WHERE user_id = %s AND crop IS NOT NULL
+                    GROUP BY crop
+                    ORDER BY diagnosis_count DESC
+                    LIMIT 6
+                """, (user_id,))
+                crop_expertise = cur.fetchall()
 
-            # Get crop expertise
-            cur.execute("""
-                SELECT 
-                    crop as name,
-                    COUNT(*) as diagnosis_count,
-                    ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER(), 1) as percentage
-                FROM diagnosis_history 
-                WHERE user_id = %s AND crop IS NOT NULL
-                GROUP BY crop
-                ORDER BY diagnosis_count DESC
-                LIMIT 6
-            """, (user_id,))
-            crop_expertise = cur.fetchall()
+                # Get common diseases
+                cur.execute("""
+                    SELECT 
+                        disease_detected as name,
+                        crop,
+                        COUNT(*) as count,
+                        MAX(created_at) as last_detected,
+                        ROUND(AVG(confidence), 1) as avg_confidence,
+                        ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER(), 1) as percentage
+                    FROM diagnosis_history 
+                    WHERE user_id = %s
+                    GROUP BY disease_detected, crop
+                    ORDER BY count DESC
+                    LIMIT 5
+                """, (user_id,))
+                common_diseases = cur.fetchall()
 
-            # Get common diseases
-            cur.execute("""
-                SELECT 
-                    disease_detected as name,
-                    crop,
-                    COUNT(*) as count,
-                    MAX(created_at) as last_detected,
-                    ROUND(AVG(confidence), 1) as avg_confidence,
-                    ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER(), 1) as percentage
-                FROM diagnosis_history 
-                WHERE user_id = %s
-                GROUP BY disease_detected, crop
-                ORDER BY count DESC
-                LIMIT 5
-            """, (user_id,))
-            common_diseases = cur.fetchall()
+                # Format last_detected
+                for disease in common_diseases:
+                    if disease['last_detected']:
+                        disease['last_detected'] = disease['last_detected'].strftime('%Y-%m-%d') if hasattr(disease['last_detected'], 'strftime') else str(disease['last_detected'])
 
-            # Format last_detected
-            for disease in common_diseases:
-                if disease['last_detected']:
-                    disease['last_detected'] = disease['last_detected'].strftime('%Y-%m-%d')
+                # Calculate profile completion
+                completion_items = [
+                    {'label': 'Profile Picture', 'completed': bool(user.get('profile_image')), 'action': '#'},
+                    {'label': 'Bio', 'completed': bool(user.get('bio')), 'action': '#'},
+                    {'label': 'Phone Number', 'completed': bool(user.get('phone_number')), 'action': '/settings'},
+                    {'label': 'Location', 'completed': bool(user.get('location')), 'action': '/settings'},
+                    {'label': 'First Diagnosis', 'completed': stats and stats['total_diagnosis'] > 0, 'action': '/upload'},
+                    {'label': 'Saved Item', 'completed': stats and stats['saved_items'] > 0, 'action': '/history'},
+                ]
 
-            # Calculate profile completion
-            completion_items = [
-                {'label': 'Profile Picture', 'completed': bool(user.get('profile_image')), 'action': '#'},
-                {'label': 'Bio', 'completed': bool(user.get('bio')), 'action': '#'},
-                {'label': 'Phone Number', 'completed': bool(user.get('phone_number')), 'action': '/settings'},
-                {'label': 'Location', 'completed': bool(user.get('location')), 'action': '/settings'},
-                {'label': 'First Diagnosis', 'completed': stats and stats['total_diagnosis'] > 0, 'action': '/upload'},
-                {'label': 'Saved Item', 'completed': stats and stats['saved_items'] > 0, 'action': '/history'},
-            ]
-
-            completed_count = sum(1 for item in completion_items if item['completed'])
-            profile_completion = int((completed_count / len(completion_items)) * 100)
+                completed_count = sum(1 for item in completion_items if item['completed'])
+                profile_completion = int((completed_count / len(completion_items)) * 100)
 
             return render_template("profile.html",
                                    user=user,
@@ -536,25 +479,20 @@ def register_user_routes(app):
                                    common_diseases=common_diseases,
                                    completion_items=completion_items,
                                    profile_completion=profile_completion,
-                                   badges=[])  # Add badges logic if you have it
+                                   badges=[])
 
         except Exception as e:
             print(f"Profile error: {e}")
+            import traceback
+            traceback.print_exc()
             flash('Error loading profile', 'danger')
             return redirect(url_for('dashboard'))
-        finally:
-            if cur:
-                cur.close()
-            if db:
-                db.close()
 
     @app.route("/api/profile/update-bio", methods=["POST"])
     @login_required
     def update_bio():
         """Update user bio"""
         user_id = session['user_id']
-        db = None
-        cur = None
 
         try:
             data = request.get_json()
@@ -564,16 +502,12 @@ def register_user_routes(app):
             if len(bio) > 500:
                 return jsonify({'success': False, 'error': 'Bio must be 500 characters or less'}), 400
 
-            db = get_db()
-            cur = db.cursor()
-
-            cur.execute("""
-                UPDATE users 
-                SET bio = %s, updated_at = NOW() 
-                WHERE id = %s
-            """, (bio, user_id))
-
-            db.commit()
+            with get_db_cursor() as cur:
+                cur.execute("""
+                    UPDATE users 
+                    SET bio = %s, updated_at = NOW() 
+                    WHERE id = %s
+                """, (bio, user_id))
 
             return jsonify({
                 'success': True,
@@ -584,25 +518,12 @@ def register_user_routes(app):
         except Exception as e:
             print(f"Update bio error: {e}")
             return jsonify({'success': False, 'error': str(e)}), 500
-        finally:
-            if cur:
-                try:
-                    cur.close()
-                except:
-                    pass
-            if db:
-                try:
-                    db.close()
-                except:
-                    pass
 
     @app.route("/api/profile/upload-image", methods=["POST"])
     @login_required
     def upload_profile_image():
         """Upload profile image"""
         user_id = session['user_id']
-        db = None
-        cur = None
 
         try:
             if 'profile_image' not in request.files:
@@ -627,11 +548,9 @@ def register_user_routes(app):
                 return jsonify({'success': False, 'error': 'File size must be less than 2MB'}), 400
 
             # Get current user to delete old image
-            db = get_db()
-            cur = db.cursor(dictionary=True)
-            cur.execute("SELECT profile_image FROM users WHERE id = %s", (user_id,))
-            user = cur.fetchone()
-            cur.close()
+            with get_db_cursor_readonly() as cur:
+                cur.execute("SELECT profile_image FROM users WHERE id = %s", (user_id,))
+                user = cur.fetchone()
 
             # Delete old image if exists
             if user and user.get('profile_image'):
@@ -653,13 +572,12 @@ def register_user_routes(app):
             file.save(filepath)
 
             # Update database
-            cur = db.cursor()
-            cur.execute("""
-                UPDATE users 
-                SET profile_image = %s, updated_at = NOW() 
-                WHERE id = %s
-            """, (filename, user_id))
-            db.commit()
+            with get_db_cursor() as cur:
+                cur.execute("""
+                    UPDATE users 
+                    SET profile_image = %s, updated_at = NOW() 
+                    WHERE id = %s
+                """, (filename, user_id))
 
             # Update session
             session['profile_image'] = filename
@@ -673,25 +591,12 @@ def register_user_routes(app):
         except Exception as e:
             print(f"Upload profile image error: {e}")
             return jsonify({'success': False, 'error': str(e)}), 500
-        finally:
-            if cur:
-                try:
-                    cur.close()
-                except:
-                    pass
-            if db:
-                try:
-                    db.close()
-                except:
-                    pass
 
     @app.route("/change-password", methods=["POST"])
     @login_required
     def change_password():
         """Change user password"""
         user_id = session['user_id']
-        db = None
-        cur = None
 
         try:
             current_password = request.form.get('current_password')
@@ -705,39 +610,25 @@ def register_user_routes(app):
             if not valid:
                 return jsonify({'success': False, 'message': message})
 
-            db = get_db()
-            cur = db.cursor(dictionary=True)
-
-            # Get current password hash
-            cur.execute("SELECT password_hash FROM users WHERE id = %s", (user_id,))
-            user = cur.fetchone()
+            with get_db_cursor_readonly() as cur:
+                # Get current password hash
+                cur.execute("SELECT password_hash FROM users WHERE id = %s", (user_id,))
+                user = cur.fetchone()
 
             if not user or not check_password(current_password, user['password_hash']):
                 return jsonify({'success': False, 'message': 'Current password is incorrect!'})
 
             # Update password
             new_hash = hash_password(new_password)
-            cur.execute("UPDATE users SET password_hash = %s WHERE id = %s",
-                        (new_hash, user_id))
-
-            db.commit()
+            with get_db_cursor() as cur:
+                cur.execute("UPDATE users SET password_hash = %s WHERE id = %s",
+                            (new_hash, user_id))
 
             return jsonify({'success': True, 'message': 'Password changed successfully!'})
 
         except Exception as e:
             print(f"Password change error: {e}")
             return jsonify({'success': False, 'message': 'Failed to change password!'})
-        finally:
-            if cur:
-                try:
-                    cur.close()
-                except:
-                    pass
-            if db:
-                try:
-                    db.close()
-                except:
-                    pass
 
     # ========== HISTORY ROUTES ==========
 
@@ -746,8 +637,6 @@ def register_user_routes(app):
     def history():
         """View diagnosis history with pagination and filters"""
         user_id = session['user_id']
-        db = None
-        cur = None
 
         try:
             # Get page number
@@ -762,9 +651,6 @@ def register_user_routes(app):
             diseases = request.args.get('diseases', '').split(',') if request.args.get('diseases') else []
             saved_only = request.args.get('saved_only') == 'true'
 
-            db = get_db()
-            cur = db.cursor(dictionary=True)
-
             # --- BUILD MAIN QUERY WITH FILTERS ---
             query = """
                 SELECT dh.id, dh.crop, dh.disease_detected, dh.confidence, 
@@ -775,26 +661,31 @@ def register_user_routes(app):
                 WHERE dh.user_id = %s
             """
             params = [user_id, user_id]
+            count_params = [user_id]
 
             # ADD DATE FILTERS
             if date_from:
                 query += " AND DATE(dh.created_at) >= %s"
                 params.append(date_from)
+                count_params.append(date_from)
             if date_to:
                 query += " AND DATE(dh.created_at) <= %s"
                 params.append(date_to)
+                count_params.append(date_to)
 
             # ADD CROP FILTERS
             if crops and crops[0] != '':
                 placeholders = ', '.join(['%s'] * len(crops))
                 query += f" AND dh.crop IN ({placeholders})"
                 params.extend(crops)
+                count_params.extend(crops)
 
             # ADD DISEASE FILTERS
             if diseases and diseases[0] != '':
                 placeholders = ', '.join(['%s'] * len(diseases))
                 query += f" AND dh.disease_detected IN ({placeholders})"
                 params.extend(diseases)
+                count_params.extend(diseases)
 
             # ADD SAVED ONLY FILTER
             if saved_only:
@@ -805,142 +696,131 @@ def register_user_routes(app):
                     )
                 """
                 params.append(user_id)
+                count_params.append(user_id)
 
             # ADD ORDER BY AND PAGINATION
             query += " ORDER BY dh.created_at DESC LIMIT %s OFFSET %s"
             params.extend([per_page, offset])
 
             # EXECUTE QUERY
-            cur.execute(query, params)
-            diagnoses = cur.fetchall()
+            with get_db_cursor_readonly() as cur:
+                cur.execute(query, params)
+                diagnoses = cur.fetchall()
 
-            # --- GET TOTAL COUNT FOR PAGINATION ---
-            count_query = """
-                SELECT COUNT(*) as total
-                FROM diagnosis_history dh
-                WHERE dh.user_id = %s
-            """
-            count_params = [user_id]
-
-            if date_from:
-                count_query += " AND DATE(dh.created_at) >= %s"
-                count_params.append(date_from)
-            if date_to:
-                count_query += " AND DATE(dh.created_at) <= %s"
-                count_params.append(date_to)
-            if crops and crops[0] != '':
-                placeholders = ', '.join(['%s'] * len(crops))
-                count_query += f" AND dh.crop IN ({placeholders})"
-                count_params.extend(crops)
-            if diseases and diseases[0] != '':
-                placeholders = ', '.join(['%s'] * len(diseases))
-                count_query += f" AND dh.disease_detected IN ({placeholders})"
-                count_params.extend(diseases)
-            if saved_only:
-                count_query += """
-                    AND EXISTS (
-                        SELECT 1 FROM saved_diagnoses 
-                        WHERE id = dh.id AND user_id = %s
-                    )
+                # --- GET TOTAL COUNT FOR PAGINATION ---
+                count_query = """
+                    SELECT COUNT(*) as total
+                    FROM diagnosis_history dh
+                    WHERE dh.user_id = %s
                 """
-                count_params.append(user_id)
 
-            cur.execute(count_query, count_params)
-            total = cur.fetchone()['total']
+                if date_from:
+                    count_query += " AND DATE(dh.created_at) >= %s"
+                if date_to:
+                    count_query += " AND DATE(dh.created_at) <= %s"
+                if crops and crops[0] != '':
+                    placeholders = ', '.join(['%s'] * len(crops))
+                    count_query += f" AND dh.crop IN ({placeholders})"
+                if diseases and diseases[0] != '':
+                    placeholders = ', '.join(['%s'] * len(diseases))
+                    count_query += f" AND dh.disease_detected IN ({placeholders})"
+                if saved_only:
+                    count_query += """
+                        AND EXISTS (
+                            SELECT 1 FROM saved_diagnoses 
+                            WHERE id = dh.id AND user_id = %s
+                        )
+                    """
 
-            # --- STATS (also filtered) ---
-            # Total diagnoses count (for stats, we'll use filtered or unfiltered?)
-            # Using filtered for consistency with displayed data
-            cur.execute(count_query, count_params)
-            total_diagnoses = cur.fetchone()['total']
+                cur.execute(count_query, count_params)
+                total = cur.fetchone()['total']
 
-            # Monthly diagnoses (using same filters)
-            monthly_query = """
-                SELECT COUNT(*) as monthly_diagnoses
-                FROM diagnosis_history dh
-                WHERE dh.user_id = %s
-                AND YEAR(dh.created_at) = YEAR(CURDATE())
-                AND MONTH(dh.created_at) = MONTH(CURDATE())
-            """
-            monthly_params = [user_id]
+                # --- STATS ---
+                # Monthly diagnoses
+                monthly_query = """
+                    SELECT COUNT(*) as monthly_diagnoses
+                    FROM diagnosis_history dh
+                    WHERE dh.user_id = %s
+                    AND EXTRACT(YEAR FROM dh.created_at) = EXTRACT(YEAR FROM CURRENT_DATE)
+                    AND EXTRACT(MONTH FROM dh.created_at) = EXTRACT(MONTH FROM CURRENT_DATE)
+                """
+                monthly_params = [user_id]
 
-            if date_from:
-                monthly_query += " AND DATE(dh.created_at) >= %s"
-                monthly_params.append(date_from)
-            if date_to:
-                monthly_query += " AND DATE(dh.created_at) <= %s"
-                monthly_params.append(date_to)
-            if crops and crops[0] != '':
-                placeholders = ', '.join(['%s'] * len(crops))
-                monthly_query += f" AND dh.crop IN ({placeholders})"
-                monthly_params.extend(crops)
-            if diseases and diseases[0] != '':
-                placeholders = ', '.join(['%s'] * len(diseases))
-                monthly_query += f" AND dh.disease_detected IN ({placeholders})"
-                monthly_params.extend(diseases)
+                if date_from:
+                    monthly_query += " AND DATE(dh.created_at) >= %s"
+                    monthly_params.append(date_from)
+                if date_to:
+                    monthly_query += " AND DATE(dh.created_at) <= %s"
+                    monthly_params.append(date_to)
+                if crops and crops[0] != '':
+                    placeholders = ', '.join(['%s'] * len(crops))
+                    monthly_query += f" AND dh.crop IN ({placeholders})"
+                    monthly_params.extend(crops)
+                if diseases and diseases[0] != '':
+                    placeholders = ', '.join(['%s'] * len(diseases))
+                    monthly_query += f" AND dh.disease_detected IN ({placeholders})"
+                    monthly_params.extend(diseases)
 
-            cur.execute(monthly_query, monthly_params)
-            monthly_diagnoses = cur.fetchone()['monthly_diagnoses']
+                cur.execute(monthly_query, monthly_params)
+                monthly_diagnoses = cur.fetchone()['monthly_diagnoses'] or 0
 
-            # Average confidence (across all user's diagnoses, or filtered?)
-            # Using all for stats, but could also filter
-            avg_conf_query = """
-                SELECT COALESCE(AVG(confidence), 0) as avg_confidence
-                FROM diagnosis_history dh
-                WHERE dh.user_id = %s
-            """
-            avg_conf_params = [user_id]
+                # Average confidence
+                avg_conf_query = """
+                    SELECT COALESCE(AVG(confidence), 0) as avg_confidence
+                    FROM diagnosis_history dh
+                    WHERE dh.user_id = %s
+                """
+                avg_conf_params = [user_id]
 
-            if date_from:
-                avg_conf_query += " AND DATE(dh.created_at) >= %s"
-                avg_conf_params.append(date_from)
-            if date_to:
-                avg_conf_query += " AND DATE(dh.created_at) <= %s"
-                avg_conf_params.append(date_to)
-            if crops and crops[0] != '':
-                placeholders = ', '.join(['%s'] * len(crops))
-                avg_conf_query += f" AND dh.crop IN ({placeholders})"
-                avg_conf_params.extend(crops)
-            if diseases and diseases[0] != '':
-                placeholders = ', '.join(['%s'] * len(diseases))
-                avg_conf_query += f" AND dh.disease_detected IN ({placeholders})"
-                avg_conf_params.extend(diseases)
+                if date_from:
+                    avg_conf_query += " AND DATE(dh.created_at) >= %s"
+                    avg_conf_params.append(date_from)
+                if date_to:
+                    avg_conf_query += " AND DATE(dh.created_at) <= %s"
+                    avg_conf_params.append(date_to)
+                if crops and crops[0] != '':
+                    placeholders = ', '.join(['%s'] * len(crops))
+                    avg_conf_query += f" AND dh.crop IN ({placeholders})"
+                    avg_conf_params.extend(crops)
+                if diseases and diseases[0] != '':
+                    placeholders = ', '.join(['%s'] * len(diseases))
+                    avg_conf_query += f" AND dh.disease_detected IN ({placeholders})"
+                    avg_conf_params.extend(diseases)
 
-            cur.execute(avg_conf_query, avg_conf_params)
-            avg_confidence = round(cur.fetchone()['avg_confidence'] or 0, 1)
+                cur.execute(avg_conf_query, avg_conf_params)
+                avg_confidence = round(cur.fetchone()['avg_confidence'] or 0, 1)
 
-            # Saved count (total saved, not filtered by date)
-            cur.execute("""
-                SELECT COUNT(*) as saved_count
-                FROM saved_diagnoses
-                WHERE user_id = %s
-            """, (user_id,))
-            saved_count = cur.fetchone()['saved_count']
+                # Saved count
+                cur.execute("""
+                    SELECT COUNT(*) as saved_count
+                    FROM saved_diagnoses
+                    WHERE user_id = %s
+                """, (user_id,))
+                saved_count = cur.fetchone()['saved_count'] or 0
 
-            # Get available crops for filter dropdown
-            cur.execute("""
-                SELECT DISTINCT crop 
-                FROM diagnosis_history 
-                WHERE user_id = %s AND crop IS NOT NULL
-                ORDER BY crop
-            """, (user_id,))
-            available_crops = [row['crop'] for row in cur.fetchall()]
+                # Get available crops for filter dropdown
+                cur.execute("""
+                    SELECT DISTINCT crop 
+                    FROM diagnosis_history 
+                    WHERE user_id = %s AND crop IS NOT NULL
+                    ORDER BY crop
+                """, (user_id,))
+                available_crops = [row['crop'] for row in cur.fetchall()]
 
-            # Get available diseases for filter dropdown
-            cur.execute("""
-                SELECT DISTINCT disease_detected 
-                FROM diagnosis_history 
-                WHERE user_id = %s AND disease_detected IS NOT NULL
-                ORDER BY disease_detected
-            """, (user_id,))
-            available_diseases = [row['disease_detected'] for row in cur.fetchall()]
+                # Get available diseases for filter dropdown
+                cur.execute("""
+                    SELECT DISTINCT disease_detected 
+                    FROM diagnosis_history 
+                    WHERE user_id = %s AND disease_detected IS NOT NULL
+                    ORDER BY disease_detected
+                """, (user_id,))
+                available_diseases = [row['disease_detected'] for row in cur.fetchall()]
 
             # --- PAGINATION OBJECT ---
-            total_pages = (total + per_page - 1) // per_page
+            total_pages = (total + per_page - 1) // per_page if total > 0 else 1
 
             def iter_pages():
                 """Generate page numbers for pagination"""
-                # Show 5 pages: current -2 to current +2
                 start = max(1, page - 2)
                 end = min(total_pages, page + 2) + 1
                 return range(start, end)
@@ -951,13 +831,13 @@ def register_user_routes(app):
                 'total': total,
                 'pages': total_pages,
                 'has_prev': page > 1,
-                'has_next': page * per_page < total,
+                'has_next': page < total_pages,
                 'prev_num': page - 1 if page > 1 else None,
-                'next_num': page + 1 if page * per_page < total else None,
+                'next_num': page + 1 if page < total_pages else None,
                 'iter_pages': iter_pages
             }
 
-            # Build query string for pagination links (preserve filters)
+            # Build query string for pagination links
             query_params = []
             if date_from:
                 query_params.append(f"date_from={date_from}")
@@ -977,7 +857,7 @@ def register_user_routes(app):
             return render_template("history.html",
                                    diagnoses=diagnoses,
                                    pagination=pagination,
-                                   total_diagnoses=total_diagnoses,
+                                   total_diagnoses=total,
                                    monthly_diagnoses=monthly_diagnoses,
                                    avg_confidence=avg_confidence,
                                    saved_count=saved_count,
@@ -996,17 +876,6 @@ def register_user_routes(app):
             traceback.print_exc()
             flash('Error loading history', 'danger')
             return redirect(url_for('dashboard'))
-        finally:
-            if cur:
-                try:
-                    cur.close()
-                except:
-                    pass
-            if db:
-                try:
-                    db.close()
-                except:
-                    pass
 
     @app.route('/diagnosis/<int:diagnosis_id>')
     @login_required
@@ -1021,20 +890,16 @@ def register_user_routes(app):
 
             print(f"🔍 Viewing diagnosis {diagnosis_id} for user {user_id}")
 
-            db = get_db()
-            cur = db.cursor(dictionary=True)
+            with get_db_cursor_readonly() as cur:
+                # Get diagnosis details
+                cur.execute("""
+                    SELECT * FROM diagnosis_history 
+                    WHERE id = %s AND user_id = %s
+                """, (diagnosis_id, user_id))
 
-            # Get diagnosis details
-            cur.execute("""
-                SELECT * FROM diagnosis_history 
-                WHERE id = %s AND user_id = %s
-            """, (diagnosis_id, user_id))
-
-            diagnosis = cur.fetchone()
+                diagnosis = cur.fetchone()
 
             if not diagnosis:
-                cur.close()
-                db.close()
                 flash('Diagnosis not found', 'danger')
                 return redirect(url_for('my_diagnoses'))
 
@@ -1052,9 +917,6 @@ def register_user_routes(app):
                         diagnosis['expert_summary'] = json.loads(diagnosis['expert_summary'])
                 except:
                     diagnosis['expert_summary'] = {}
-
-            cur.close()
-            db.close()
 
             # Create a result dictionary
             result = {
@@ -1076,7 +938,6 @@ def register_user_routes(app):
             print(f"ID: {result['id']}")
             print(f"Disease: {result['disease']}")
             print(f"Crop: {result['crop']}")
-
             print(f"Symptoms: {result['symptoms']}")
             print(f"Recommendations: {result['recommendations']}")
             print(f"Created at: {result['created_at']}")
@@ -1096,105 +957,83 @@ def register_user_routes(app):
     def save_diagnosis(diagnosis_id):
         """Save/unsave a diagnosis"""
         user_id = session['user_id']
-        db = None
-        cur = None
 
         try:
             action = request.json.get('action', 'save')
-            db = get_db()
-            cur = db.cursor()
+            notes = request.json.get('notes', '')
 
-            if action == 'save':
-                notes = request.json.get('notes', '')
-                cur.execute("""
-                    INSERT IGNORE INTO saved_diagnoses (user_id, diagnosis_id, notes)
-                    VALUES (%s, %s, %s)
-                """, (user_id, diagnosis_id, notes))
-                message = 'Diagnosis saved!'
-            else:
-                cur.execute("""
-                    DELETE FROM saved_diagnoses 
-                    WHERE user_id = %s AND diagnosis_id = %s
-                """, (user_id, diagnosis_id))
-                message = 'Diagnosis removed from saved!'
-
-            db.commit()
+            with get_db_cursor() as cur:
+                if action == 'save':
+                    # Use INSERT ... ON CONFLICT DO NOTHING for PostgreSQL
+                    cur.execute("""
+                        INSERT INTO saved_diagnoses (user_id, id, notes, created_at)
+                        VALUES (%s, %s, %s, NOW())
+                        ON CONFLICT (user_id, id) DO NOTHING
+                    """, (user_id, diagnosis_id, notes))
+                    message = 'Diagnosis saved!'
+                else:
+                    cur.execute("""
+                        DELETE FROM saved_diagnoses 
+                        WHERE user_id = %s AND id = %s
+                    """, (user_id, diagnosis_id))
+                    message = 'Diagnosis removed from saved!'
 
             return jsonify({'success': True, 'message': message})
 
         except Exception as e:
             print(f"Save diagnosis error: {e}")
             return jsonify({'success': False, 'message': 'Operation failed!'})
-        finally:
-            if cur:
-                try:
-                    cur.close()
-                except:
-                    pass
-            if db:
-                try:
-                    db.close()
-                except:
-                    pass
 
     @app.route("/saved")
     @login_required
     def saved_diagnoses():
         """View saved diagnoses"""
         user_id = session['user_id']
-        db = None
-        cur = None
 
         try:
-            db = get_db()
-            cur = db.cursor(dictionary=True)
+            with get_db_cursor_readonly() as cur:
+                cur.execute("""
+                    SELECT sd.*, dh.image_path, dh.crop as history_crop, 
+                           dh.disease_detected, dh.confidence as history_confidence,
+                           dh.symptoms as history_symptoms, dh.recommendations as history_recommendations
+                    FROM saved_diagnoses sd
+                    LEFT JOIN diagnosis_history dh ON sd.id = dh.id
+                    WHERE sd.user_id = %s
+                    ORDER BY sd.created_at DESC
+                """, (user_id,))
+                saved_diagnoses = cur.fetchall()
 
-            # FIXED: Join diagnosis_history to get image_path
-            cur.execute("""
-                SELECT sd.*, dh.image_path, dh.crop as history_crop, 
-                       dh.disease_detected, dh.confidence as history_confidence,
-                       dh.symptoms as history_symptoms, dh.recommendations as history_recommendations
-                FROM saved_diagnoses sd
-                LEFT JOIN diagnosis_history dh ON sd.id = dh.id
-                WHERE sd.user_id = %s
-                ORDER BY sd.created_at DESC
-            """, (user_id,))
-            saved_diagnoses = cur.fetchall()
+                # --- CALCULATE STATS ---
+                total_saved = len(saved_diagnoses)
 
-            # --- CALCULATE STATS ---
-            total_saved = len(saved_diagnoses)
+                # Get disease names
+                diseases_list = []
+                for d in saved_diagnoses:
+                    disease = d.get('disease_detected') or d.get('disease')
+                    if disease:
+                        diseases_list.append(disease)
+                unique_diseases = len(set(diseases_list))
 
-            # Get disease names (prefer from diagnosis_history, fallback to saved_diagnoses)
-            diseases_list = []
-            for d in saved_diagnoses:
-                disease = d.get('disease_detected') or d.get('disease')
-                if disease:
-                    diseases_list.append(disease)
-            unique_diseases = len(set(diseases_list))
+                # Get crop names
+                crops_list = []
+                for d in saved_diagnoses:
+                    crop = d.get('history_crop') or d.get('crop')
+                    if crop:
+                        crops_list.append(crop)
+                unique_crops = len(set(crops_list))
 
-            # Get crop names (prefer from diagnosis_history, fallback to saved_diagnoses)
-            crops_list = []
-            for d in saved_diagnoses:
-                crop = d.get('history_crop') or d.get('crop')
-                if crop:
-                    crops_list.append(crop)
-            unique_crops = len(set(crops_list))
+                # Average confidence
+                confidence_values = []
+                for d in saved_diagnoses:
+                    conf = d.get('history_confidence') or d.get('confidence')
+                    if conf:
+                        confidence_values.append(float(conf))
 
-            # Average confidence (prefer from diagnosis_history, fallback to saved_diagnoses)
-            confidence_values = []
-            for d in saved_diagnoses:
-                conf = d.get('history_confidence') or d.get('confidence')
-                if conf:
-                    confidence_values.append(float(conf))
+                avg_confidence = round(sum(confidence_values) / len(confidence_values), 1) if confidence_values else 0
 
-            if confidence_values:
-                avg_confidence = round(sum(confidence_values) / len(confidence_values), 1)
-            else:
-                avg_confidence = 0
-
-            # Get unique crops for filter dropdown
-            crops = sorted(list(set([(d.get('history_crop') or d.get('crop')) for d in saved_diagnoses if
-                                     (d.get('history_crop') or d.get('crop'))])))
+                # Get unique crops for filter dropdown
+                crops = sorted(list(set([(d.get('history_crop') or d.get('crop')) for d in saved_diagnoses if
+                                         (d.get('history_crop') or d.get('crop'))])))
 
             return render_template("saved.html",
                                    saved_diagnoses=saved_diagnoses,
@@ -1209,17 +1048,6 @@ def register_user_routes(app):
             traceback.print_exc()
             flash('Error loading saved diagnoses', 'danger')
             return redirect(url_for('dashboard'))
-        finally:
-            if cur:
-                try:
-                    cur.close()
-                except:
-                    pass
-            if db:
-                try:
-                    db.close()
-                except:
-                    pass
 
     @app.route("/api/diagnosis/<int:diagnosis_id>", methods=["DELETE"])
     @login_required
@@ -1228,18 +1056,16 @@ def register_user_routes(app):
         user_id = session['user_id']
 
         try:
-            db = get_db()
-            cur = db.cursor()
-
             # First, get the image path to delete the file
-            cur.execute("""
-                SELECT image_path FROM diagnosis_history 
-                WHERE id = %s AND user_id = %s
-            """, (diagnosis_id, user_id))
+            with get_db_cursor_readonly() as cur:
+                cur.execute("""
+                    SELECT image_path FROM diagnosis_history 
+                    WHERE id = %s AND user_id = %s
+                """, (diagnosis_id, user_id))
+                result = cur.fetchone()
 
-            result = cur.fetchone()
-            if result and result[0]:
-                image_path = result[0]
+            if result and result.get('image_path'):
+                image_path = result['image_path']
                 # Try to delete the image file
                 try:
                     app_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1258,21 +1084,18 @@ def register_user_routes(app):
                 except Exception as e:
                     print(f"⚠️ Could not delete image file: {e}")
 
-            # Delete from saved_diagnoses first - FIXED: use id column
-            cur.execute("""
-                DELETE FROM saved_diagnoses 
-                WHERE id = %s
-            """, (diagnosis_id,))
+            # Delete from saved_diagnoses first
+            with get_db_cursor() as cur:
+                cur.execute("""
+                    DELETE FROM saved_diagnoses 
+                    WHERE id = %s AND user_id = %s
+                """, (diagnosis_id, user_id))
 
-            # Then delete the diagnosis
-            cur.execute("""
-                DELETE FROM diagnosis_history 
-                WHERE id = %s AND user_id = %s
-            """, (diagnosis_id, user_id))
-
-            db.commit()
-            cur.close()
-            db.close()
+                # Then delete the diagnosis
+                cur.execute("""
+                    DELETE FROM diagnosis_history 
+                    WHERE id = %s AND user_id = %s
+                """, (diagnosis_id, user_id))
 
             return jsonify({'success': True, 'message': 'Diagnosis deleted successfully'})
 
@@ -1285,20 +1108,13 @@ def register_user_routes(app):
     def fix_image_paths():
         """Clean up image paths in database"""
         try:
-            db = get_db()
-            cursor = db.cursor()
-
-            # Fix records with 'uploads/' prefix
-            cursor.execute("""
-                UPDATE diagnosis_history 
-                SET image_path = REPLACE(image_path, 'uploads/', '')
-                WHERE image_path LIKE 'uploads/%'
-            """)
-            updated = cursor.rowcount
-            db.commit()
-
-            cursor.close()
-            db.close()
+            with get_db_cursor() as cursor:
+                cursor.execute("""
+                    UPDATE diagnosis_history 
+                    SET image_path = REPLACE(image_path, 'uploads/', '')
+                    WHERE image_path LIKE 'uploads/%'
+                """)
+                updated = cursor.rowcount
 
             return f"✅ Fixed {updated} records. Images should now load correctly."
 
@@ -1312,16 +1128,13 @@ def register_user_routes(app):
         user_id = session['user_id']
 
         try:
-            db = get_db()
-            cur = db.cursor(dictionary=True)
-
             # Get all image paths to delete files
-            cur.execute("""
-                SELECT image_path FROM diagnosis_history
-                WHERE user_id = %s AND image_path IS NOT NULL
-            """, (user_id,))
-
-            images = cur.fetchall()
+            with get_db_cursor_readonly() as cur:
+                cur.execute("""
+                    SELECT image_path FROM diagnosis_history
+                    WHERE user_id = %s AND image_path IS NOT NULL
+                """, (user_id,))
+                images = cur.fetchall()
 
             # Delete image files
             app_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1344,21 +1157,19 @@ def register_user_routes(app):
                         print(f"⚠️ Could not delete image file: {e}")
 
             # Delete from saved_diagnoses first
-            cur.execute("""
-                DELETE FROM saved_diagnoses 
-                WHERE user_id = %s
-            """, (user_id,))
+            with get_db_cursor() as cur:
+                cur.execute("""
+                    DELETE FROM saved_diagnoses 
+                    WHERE user_id = %s
+                """, (user_id,))
 
-            # Then delete all diagnoses
-            cur.execute("""
-                DELETE FROM diagnosis_history
-                WHERE user_id = %s
-            """, (user_id,))
+                # Then delete all diagnoses
+                cur.execute("""
+                    DELETE FROM diagnosis_history
+                    WHERE user_id = %s
+                """, (user_id,))
 
-            deleted_count = cur.rowcount
-            db.commit()
-            cur.close()
-            db.close()
+                deleted_count = cur.rowcount
 
             return jsonify({
                 'success': True,
@@ -1375,60 +1186,58 @@ def register_user_routes(app):
         """Toggle save status of a diagnosis"""
         try:
             user_id = session['user_id']
-            db = get_db()
-            cursor = db.cursor(dictionary=True)
 
-            # Check if already saved
-            cursor.execute("""
-                SELECT id FROM saved_diagnoses 
-                WHERE user_id = %s AND id = %s
-            """, (user_id, id))
-
-            existing = cursor.fetchone()
+            with get_db_cursor_readonly() as cur:
+                # Check if already saved
+                cur.execute("""
+                    SELECT id FROM saved_diagnoses 
+                    WHERE user_id = %s AND id = %s
+                """, (user_id, id))
+                existing = cur.fetchone()
 
             if existing:
                 # Remove from saved
-                cursor.execute("""
-                    DELETE FROM saved_diagnoses 
-                    WHERE user_id = %s AND id = %s
-                """, (user_id, id))
+                with get_db_cursor() as cur:
+                    cur.execute("""
+                        DELETE FROM saved_diagnoses 
+                        WHERE user_id = %s AND id = %s
+                    """, (user_id, id))
                 saved = False
                 message = "Diagnosis removed from saved"
             else:
                 # Get diagnosis details from history
-                cursor.execute("""
-                    SELECT id, crop, disease_detected, confidence, 
-                           symptoms, recommendations, final_confidence_level, created_at
-                    FROM diagnosis_history WHERE id = %s
-                """, (id,))
-                diagnosis = cursor.fetchone()
+                with get_db_cursor_readonly() as cur:
+                    cur.execute("""
+                        SELECT id, crop, disease_detected, confidence, 
+                               symptoms, recommendations, final_confidence_level, created_at
+                        FROM diagnosis_history WHERE id = %s
+                    """, (id,))
+                    diagnosis = cur.fetchone()
 
                 if not diagnosis:
                     return jsonify({'success': False, 'error': 'Diagnosis not found'}), 404
 
-                # Save to saved_diagnoses - matching your table structure
-                cursor.execute("""
-                    INSERT INTO saved_diagnoses 
-                    (id, user_id, crop, disease, confidence, 
-                     symptoms, recommendations, status, created_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    id,  # diagnosis_id
-                    user_id,  # user_id
-                    diagnosis['crop'],  # crop
-                    diagnosis['disease_detected'],  # disease
-                    diagnosis['confidence'],  # confidence
-                    diagnosis['symptoms'],  # symptoms
-                    diagnosis['recommendations'],  # recommendations
-                    diagnosis.get('final_confidence_level', 'AI Only'),  # status
-                    diagnosis['created_at']  # created_at
-                ))
+                # Save to saved_diagnoses
+                with get_db_cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO saved_diagnoses 
+                        (id, user_id, crop, disease, confidence, 
+                         symptoms, recommendations, status, created_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (user_id, id) DO NOTHING
+                    """, (
+                        id,
+                        user_id,
+                        diagnosis['crop'],
+                        diagnosis['disease_detected'],
+                        diagnosis['confidence'],
+                        diagnosis['symptoms'],
+                        diagnosis['recommendations'],
+                        diagnosis.get('final_confidence_level', 'AI Only'),
+                        diagnosis['created_at']
+                    ))
                 saved = True
                 message = "Diagnosis saved successfully"
-
-            db.commit()
-            cursor.close()
-            db.close()
 
             return jsonify({
                 'success': True,
@@ -1459,18 +1268,14 @@ def register_user_routes(app):
             if not ids:
                 return jsonify({'saved': []})
 
-            db = get_db()
-            cursor = db.cursor()
+            with get_db_cursor_readonly() as cur:
+                placeholders = ','.join(['%s'] * len(ids))
+                cur.execute(f"""
+                    SELECT id FROM saved_diagnoses 
+                    WHERE user_id = %s AND id IN ({placeholders})
+                """, [user_id] + ids)
 
-            placeholders = ','.join(['%s'] * len(ids))
-            cursor.execute(f"""
-                SELECT id FROM saved_diagnoses 
-                WHERE user_id = %s AND id IN ({placeholders})
-            """, [user_id] + ids)
-
-            saved = [row[0] for row in cursor.fetchall()]
-            cursor.close()
-            db.close()
+                saved = [row['id'] for row in cur.fetchall()]
 
             return jsonify({'saved': saved})
 
@@ -1489,47 +1294,43 @@ def register_user_routes(app):
 
         try:
             if user_id:
-                db = get_db()
-                cur = db.cursor(dictionary=True)
-
-                # Check if table exists first
-                cur.execute("SHOW TABLES LIKE 'feedback'")
-                if cur.fetchone():
-                    cur.execute("""
-                        SELECT * FROM feedback 
-                        WHERE user_id = %s 
-                        ORDER BY created_at DESC 
-                        LIMIT 10
-                    """, (user_id,))
-                    user_feedback = cur.fetchall()
-                cur.close()
-                db.close()
+                with get_db_cursor_readonly() as cur:
+                    # Check if table exists by trying to query it
+                    try:
+                        cur.execute("""
+                            SELECT * FROM feedback 
+                            WHERE user_id = %s 
+                            ORDER BY created_at DESC 
+                            LIMIT 10
+                        """, (user_id,))
+                        user_feedback = cur.fetchall()
+                    except:
+                        # Table might not exist
+                        user_feedback = []
 
         except Exception as e:
             print(f"Error loading user feedback: {e}")
 
         return render_template('feedback.html', user_feedback=user_feedback)
 
-    @app.route('/feedback')
+    @app.route('/feedback-page')
     def feedback_page():
         """Display feedback form and user's previous feedback"""
         user_feedback = []
 
         # If user is logged in, get their previous feedback
         if session.get('user_id'):
-            db = get_db()
-            cur = db.cursor(dictionary=True)
-
-            cur.execute("""
-                SELECT * FROM feedback 
-                WHERE user_id = %s 
-                ORDER BY created_at DESC 
-                LIMIT 10
-            """, (session['user_id'],))
-
-            user_feedback = cur.fetchall()
-            cur.close()
-            db.close()
+            try:
+                with get_db_cursor_readonly() as cur:
+                    cur.execute("""
+                        SELECT * FROM feedback 
+                        WHERE user_id = %s 
+                        ORDER BY created_at DESC 
+                        LIMIT 10
+                    """, (session['user_id'],))
+                    user_feedback = cur.fetchall()
+            except:
+                user_feedback = []
 
         return render_template('feedback.html', user_feedback=user_feedback)
 
@@ -1589,29 +1390,22 @@ def register_user_routes(app):
                             file.save(file_path)
                             image_file = filename
 
-            # Get database connection
-            db = get_db()
-            cur = db.cursor()  # Make sure this is correct for your DB connector
-
             # Insert into database
-            cur.execute("""
-                INSERT INTO feedback 
-                (user_id, name, email, feedback_type, subject, message, image_path, status, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
-            """, (
-                user_id,
-                name,
-                email,
-                feedback_type,
-                subject,
-                message,
-                image_file,
-                'pending'
-            ))
-
-            db.commit()
-            cur.close()
-            db.close()
+            with get_db_cursor() as cur:
+                cur.execute("""
+                    INSERT INTO feedback 
+                    (user_id, name, email, feedback_type, subject, message, image_path, status, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                """, (
+                    user_id,
+                    name,
+                    email,
+                    feedback_type,
+                    subject,
+                    message,
+                    image_file,
+                    'pending'
+                ))
 
             flash('Thank you for your feedback! We appreciate your input.', 'success')
             return redirect(url_for('feedback_page'))
@@ -1628,25 +1422,32 @@ def register_user_routes(app):
     def test_feedback_db():
         """Test feedback table structure"""
         try:
-            db = get_db()
-            cur = db.cursor()
+            with get_db_cursor_readonly() as cur:
+                # Check if table exists
+                cur.execute("""
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables 
+                        WHERE table_name = 'feedback'
+                    ) as exists
+                """)
+                exists = cur.fetchone()['exists']
 
-            # Check if table exists
-            cur.execute("SHOW TABLES LIKE 'feedback'")
-            if not cur.fetchone():
-                return "❌ feedback table does not exist!"
+                if not exists:
+                    return "❌ feedback table does not exist!"
 
-            # Show table structure
-            cur.execute("DESCRIBE feedback")
-            columns = cur.fetchall()
+                # Get column info from information_schema
+                cur.execute("""
+                    SELECT column_name, data_type 
+                    FROM information_schema.columns 
+                    WHERE table_name = 'feedback'
+                    ORDER BY ordinal_position
+                """)
+                columns = cur.fetchall()
 
-            result = "<h3>Feedback Table Structure:</h3><ul>"
-            for col in columns:
-                result += f"<li>{col[0]} - {col[1]}</li>"
-            result += "</ul>"
-
-            cur.close()
-            db.close()
+                result = "<h3>Feedback Table Structure:</h3><ul>"
+                for col in columns:
+                    result += f"<li>{col['column_name']} - {col['data_type']}</li>"
+                result += "</ul>"
 
             return result
 
@@ -1674,19 +1475,15 @@ def register_user_routes(app):
     def diagnosis_feedback(diagnosis_id):
         """Submit feedback for a diagnosis"""
         user_id = session['user_id']
-        db = None
-        cur = None
 
         try:
             # Verify diagnosis belongs to user
-            db = get_db()
-            cur = db.cursor(dictionary=True)
-            cur.execute("SELECT id FROM diagnosis_history WHERE id = %s AND user_id = %s",
-                        (diagnosis_id, user_id))
-
-            if not cur.fetchone():
-                flash('Diagnosis not found!', 'danger')
-                return redirect(url_for('history'))
+            with get_db_cursor_readonly() as cur:
+                cur.execute("SELECT id FROM diagnosis_history WHERE id = %s AND user_id = %s",
+                            (diagnosis_id, user_id))
+                if not cur.fetchone():
+                    flash('Diagnosis not found!', 'danger')
+                    return redirect(url_for('history'))
 
             if request.method == "POST":
                 rating = request.form.get('rating')
@@ -1694,27 +1491,28 @@ def register_user_routes(app):
                 feedback_text = request.form.get('feedback')
                 suggestions = request.form.get('suggestions')
 
-                cur.execute("""
-                    INSERT INTO feedback 
-                    (user_id, diagnosis_id, rating, accuracy_rating, 
-                     feedback_text, suggestions)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    ON DUPLICATE KEY UPDATE
-                    rating = VALUES(rating),
-                    accuracy_rating = VALUES(accuracy_rating),
-                    feedback_text = VALUES(feedback_text),
-                    suggestions = VALUES(suggestions),
-                    created_at = NOW()
-                """, (user_id, diagnosis_id, rating, accuracy, feedback_text, suggestions))
-
-                db.commit()
+                with get_db_cursor() as cur:
+                    # PostgreSQL upsert
+                    cur.execute("""
+                        INSERT INTO feedback 
+                        (user_id, diagnosis_id, rating, accuracy_rating, 
+                         feedback_text, suggestions, created_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                        ON CONFLICT (user_id, diagnosis_id) DO UPDATE SET
+                            rating = EXCLUDED.rating,
+                            accuracy_rating = EXCLUDED.accuracy_rating,
+                            feedback_text = EXCLUDED.feedback_text,
+                            suggestions = EXCLUDED.suggestions,
+                            created_at = NOW()
+                    """, (user_id, diagnosis_id, rating, accuracy, feedback_text, suggestions))
 
                 flash('Thank you for your feedback!', 'success')
                 return redirect(url_for('view_diagnosis', diagnosis_id=diagnosis_id))
 
             # GET request - show feedback form
-            cur.execute("SELECT * FROM diagnosis_history WHERE id = %s", (diagnosis_id,))
-            diagnosis = cur.fetchone()
+            with get_db_cursor_readonly() as cur:
+                cur.execute("SELECT * FROM diagnosis_history WHERE id = %s", (diagnosis_id,))
+                diagnosis = cur.fetchone()
 
             return render_template("feedback_form.html", diagnosis=diagnosis)
 
@@ -1722,17 +1520,6 @@ def register_user_routes(app):
             print(f"Feedback error: {e}")
             flash('Failed to submit feedback.', 'danger')
             return redirect(url_for('view_diagnosis', diagnosis_id=diagnosis_id))
-        finally:
-            if cur:
-                try:
-                    cur.close()
-                except:
-                    pass
-            if db:
-                try:
-                    db.close()
-                except:
-                    pass
 
     @app.route("/api/feedback/stats")
     @login_required
@@ -1741,34 +1528,29 @@ def register_user_routes(app):
         if session.get('user_type') != 'admin':
             return jsonify({'error': 'Unauthorized'}), 403
 
-        db = None
-        cur = None
-
         try:
-            db = get_db()
-            cur = db.cursor(dictionary=True)
+            with get_db_cursor_readonly() as cur:
+                # Overall stats
+                cur.execute("""
+                    SELECT 
+                        COUNT(*) as total_feedback,
+                        AVG(rating) as avg_rating,
+                        AVG(accuracy_rating) as avg_accuracy,
+                        COUNT(DISTINCT user_id) as unique_users
+                    FROM feedback
+                """)
+                stats = cur.fetchone()
 
-            # Overall stats
-            cur.execute("""
-                SELECT 
-                    COUNT(*) as total_feedback,
-                    AVG(rating) as avg_rating,
-                    AVG(accuracy_rating) as avg_accuracy,
-                    COUNT(DISTINCT user_id) as unique_users
-                FROM feedback
-            """)
-            stats = cur.fetchone()
-
-            # Recent feedback
-            cur.execute("""
-                SELECT f.*, u.username, u.full_name, dh.disease_detected
-                FROM feedback f
-                JOIN users u ON f.user_id = u.id
-                JOIN diagnosis_history dh ON f.diagnosis_id = dh.id
-                ORDER BY f.created_at DESC
-                LIMIT 10
-            """)
-            recent_feedback = cur.fetchall()
+                # Recent feedback
+                cur.execute("""
+                    SELECT f.*, u.username, u.full_name, dh.disease_detected
+                    FROM feedback f
+                    LEFT JOIN users u ON f.user_id = u.id
+                    LEFT JOIN diagnosis_history dh ON f.diagnosis_id = dh.id
+                    ORDER BY f.created_at DESC
+                    LIMIT 10
+                """)
+                recent_feedback = cur.fetchall()
 
             return jsonify({
                 'stats': stats,
@@ -1778,243 +1560,193 @@ def register_user_routes(app):
         except Exception as e:
             print(f"Feedback stats error: {e}")
             return jsonify({'error': str(e)}), 500
-        finally:
-            if cur:
-                try:
-                    cur.close()
-                except:
-                    pass
-            if db:
-                try:
-                    db.close()
-                except:
-                    pass
 
-        # ========== ADMIN DASHBOARD ==========
+    # ========== ADMIN DASHBOARD ==========
 
     @app.route("/admin/dashboard")
     @admin_required
     def admin_dashboard():
         """Admin dashboard with comprehensive analytics"""
-        db = None
-        cur = None
-
         try:
-            db = get_db()
-            cur = db.cursor(dictionary=True)
-
-            # Get user statistics
-            cur.execute("""
-                SELECT 
-                    COUNT(*) as total_users,
-                    SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END) as active_users,
-                    SUM(CASE WHEN is_active = 0 OR is_active IS NULL THEN 1 ELSE 0 END) as inactive_users,
-                    SUM(CASE WHEN user_type = 'farmer' THEN 1 ELSE 0 END) as total_farmers,
-                    SUM(CASE WHEN user_type = 'expert' THEN 1 ELSE 0 END) as total_experts,
-                    SUM(CASE WHEN user_type = 'researcher' THEN 1 ELSE 0 END) as total_researchers,
-                    SUM(CASE WHEN user_type = 'student' THEN 1 ELSE 0 END) as total_students,
-                    SUM(CASE WHEN user_type = 'admin' THEN 1 ELSE 0 END) as total_admins
-                FROM users
-            """)
-            user_stats = cur.fetchone()
-
-            # Active users today
-            cur.execute("""
-                SELECT COUNT(DISTINCT user_id) as active_today
-                FROM diagnosis_history
-                WHERE DATE(created_at) = CURDATE()
-            """)
-            active_today = cur.fetchone()['active_today'] or 0
-            active_today = int(active_today)
-
-            # ===== DIAGNOSIS STATISTICS =====
-            cur.execute("SELECT COUNT(*) as total FROM diagnosis_history")
-            total_diagnoses = cur.fetchone()['total'] or 0
-            total_diagnoses = int(total_diagnoses)
-
-            cur.execute("""
-                SELECT COUNT(*) as monthly
-                FROM diagnosis_history
-                WHERE MONTH(created_at) = MONTH(CURDATE()) 
-                AND YEAR(created_at) = YEAR(CURDATE())
-            """)
-            monthly_diagnoses = cur.fetchone()['monthly'] or 0
-            monthly_diagnoses = int(monthly_diagnoses)
-
-            # Average confidence
-            cur.execute("""
-                SELECT ROUND(AVG(confidence), 1) as avg_confidence
-                FROM diagnosis_history
-            """)
-            avg_confidence = cur.fetchone()['avg_confidence'] or 0
-            avg_confidence = int(avg_confidence)
-
-            # Top diseases detected
-            cur.execute("""
-                SELECT 
-                    disease_detected,
-                    COUNT(*) as count,
-                    ROUND(AVG(confidence), 1) as avg_confidence
-                FROM diagnosis_history
-                WHERE disease_detected != 'healthy' AND disease_detected IS NOT NULL
-                GROUP BY disease_detected
-                ORDER BY count DESC
-                LIMIT 5
-            """)
-            top_diseases = cur.fetchall()
-
-            # Convert Decimal values in top_diseases
-            for disease in top_diseases:
-                disease['count'] = int(disease['count'])
-                disease['avg_confidence'] = float(disease['avg_confidence']) if disease['avg_confidence'] else 0
-
-            # Diagnoses by crop
-            cur.execute("""
-                SELECT 
-                    crop,
-                    COUNT(*) as count
-                FROM diagnosis_history
-                WHERE crop IS NOT NULL
-                GROUP BY crop
-                ORDER BY count DESC
-            """)
-            diagnoses_by_crop = cur.fetchall()
-
-            for crop in diagnoses_by_crop:
-                crop['count'] = int(crop['count'])
-
-            # ===== DISEASE INFO STATISTICS =====
-            cur.execute("SELECT COUNT(*) as total_diseases FROM disease_info")
-            total_diseases = cur.fetchone()['total_diseases'] or 0
-            total_diseases = int(total_diseases)
-
-            # Disease distribution by crop from disease_info
-            cur.execute("""
-                SELECT 
-                    crop,
-                    COUNT(*) as disease_count
-                FROM disease_info
-                GROUP BY crop
-                ORDER BY disease_count DESC
-            """)
-            disease_by_crop = cur.fetchall()
-
-            for crop in disease_by_crop:
-                crop['disease_count'] = int(crop['disease_count'])
-
-            # ===== FEEDBACK STATISTICS =====
-            # Check if feedback table exists
-            cur.execute("""
-                SELECT COUNT(*) as table_exists 
-                FROM information_schema.tables 
-                WHERE table_schema = DATABASE() 
-                AND table_name = 'feedback'
-            """)
-            feedback_table_exists = cur.fetchone()['table_exists'] > 0
-
-            if feedback_table_exists:
+            with get_db_cursor_readonly() as cur:
+                # Get user statistics
                 cur.execute("""
                     SELECT 
-                        COUNT(*) as total_feedback,
-                        SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending_feedback,
-                        SUM(CASE WHEN status = 'resolved' THEN 1 ELSE 0 END) as resolved_feedback
-                    FROM feedback
+                        COUNT(*) as total_users,
+                        SUM(CASE WHEN is_active = TRUE THEN 1 ELSE 0 END) as active_users,
+                        SUM(CASE WHEN is_active = FALSE OR is_active IS NULL THEN 1 ELSE 0 END) as inactive_users,
+                        SUM(CASE WHEN user_type = 'farmer' THEN 1 ELSE 0 END) as total_farmers,
+                        SUM(CASE WHEN user_type = 'expert' THEN 1 ELSE 0 END) as total_experts,
+                        SUM(CASE WHEN user_type = 'researcher' THEN 1 ELSE 0 END) as total_researchers,
+                        SUM(CASE WHEN user_type = 'student' THEN 1 ELSE 0 END) as total_students,
+                        SUM(CASE WHEN user_type = 'admin' THEN 1 ELSE 0 END) as total_admins
+                    FROM users
                 """)
-                feedback_stats = cur.fetchone()
-                if feedback_stats:
-                    feedback_stats['total_feedback'] = int(feedback_stats['total_feedback'] or 0)
-                    feedback_stats['pending_feedback'] = int(feedback_stats['pending_feedback'] or 0)
-                    feedback_stats['resolved_feedback'] = int(feedback_stats['resolved_feedback'] or 0)
+                user_stats = cur.fetchone()
+
+                # Active users today
+                cur.execute("""
+                    SELECT COUNT(DISTINCT user_id) as active_today
+                    FROM diagnosis_history
+                    WHERE DATE(created_at) = CURRENT_DATE
+                """)
+                active_today = cur.fetchone()['active_today'] or 0
+
+                # ===== DIAGNOSIS STATISTICS =====
+                cur.execute("SELECT COUNT(*) as total FROM diagnosis_history")
+                total_diagnoses = cur.fetchone()['total'] or 0
+
+                cur.execute("""
+                    SELECT COUNT(*) as monthly
+                    FROM diagnosis_history
+                    WHERE EXTRACT(MONTH FROM created_at) = EXTRACT(MONTH FROM CURRENT_DATE) 
+                    AND EXTRACT(YEAR FROM created_at) = EXTRACT(YEAR FROM CURRENT_DATE)
+                """)
+                monthly_diagnoses = cur.fetchone()['monthly'] or 0
+
+                # Average confidence
+                cur.execute("""
+                    SELECT COALESCE(ROUND(AVG(confidence), 1), 0) as avg_confidence
+                    FROM diagnosis_history
+                """)
+                avg_confidence = cur.fetchone()['avg_confidence'] or 0
+
+                # Top diseases detected
+                cur.execute("""
+                    SELECT 
+                        disease_detected,
+                        COUNT(*) as count,
+                        ROUND(AVG(confidence), 1) as avg_confidence
+                    FROM diagnosis_history
+                    WHERE disease_detected != 'healthy' AND disease_detected IS NOT NULL
+                    GROUP BY disease_detected
+                    ORDER BY count DESC
+                    LIMIT 5
+                """)
+                top_diseases = cur.fetchall()
+
+                # Diagnoses by crop
+                cur.execute("""
+                    SELECT 
+                        crop,
+                        COUNT(*) as count
+                    FROM diagnosis_history
+                    WHERE crop IS NOT NULL
+                    GROUP BY crop
+                    ORDER BY count DESC
+                """)
+                diagnoses_by_crop = cur.fetchall()
+
+                # ===== DISEASE INFO STATISTICS =====
+                cur.execute("SELECT COUNT(*) as total_diseases FROM disease_info")
+                total_diseases = cur.fetchone()['total_diseases'] or 0
+
+                # Disease distribution by crop from disease_info
+                cur.execute("""
+                    SELECT 
+                        crop,
+                        COUNT(*) as disease_count
+                    FROM disease_info
+                    GROUP BY crop
+                    ORDER BY disease_count DESC
+                """)
+                disease_by_crop = cur.fetchall()
+
+                # ===== FEEDBACK STATISTICS =====
+                # Check if feedback table exists
+                cur.execute("""
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables 
+                        WHERE table_name = 'feedback'
+                    ) as table_exists
+                """)
+                feedback_table_exists = cur.fetchone()['table_exists']
+
+                if feedback_table_exists:
+                    cur.execute("""
+                        SELECT 
+                            COUNT(*) as total_feedback,
+                            SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending_feedback,
+                            SUM(CASE WHEN status = 'resolved' THEN 1 ELSE 0 END) as resolved_feedback
+                        FROM feedback
+                    """)
+                    feedback_stats = cur.fetchone()
+                    if not feedback_stats:
+                        feedback_stats = {'total_feedback': 0, 'pending_feedback': 0, 'resolved_feedback': 0}
                 else:
                     feedback_stats = {'total_feedback': 0, 'pending_feedback': 0, 'resolved_feedback': 0}
-            else:
-                feedback_stats = {'total_feedback': 0, 'pending_feedback': 0, 'resolved_feedback': 0}
 
-            # ===== CONFIDENCE STATS =====
-            confidence_stats = {
-                'avg_confidence': avg_confidence
-            }
+                # ===== RECENT ACTIVITIES =====
+                cur.execute("""
+                    SELECT 
+                        dh.created_at,
+                        u.username,
+                        CONCAT('Diagnosed ', dh.disease_detected, ' on ', dh.crop) as action,
+                        u.id as user_id
+                    FROM diagnosis_history dh
+                    JOIN users u ON dh.user_id = u.id
+                    ORDER BY dh.created_at DESC
+                    LIMIT 10
+                """)
+                recent_activities = cur.fetchall()
 
-            # ===== ACCURACY STATS =====
-            accuracy_stats = {
-                'accuracy_rate': avg_confidence,
-                'total_verified': total_diagnoses,
-                'accurate_detections': int(total_diagnoses * (avg_confidence / 100)) if avg_confidence > 0 else 0
-            }
+                # ===== ADD AVATAR COLORS =====
+                avatar_colors = [
+                    '#0d6efd', '#198754', '#dc3545', '#ffc107', '#0dcaf0',
+                    '#6610f2', '#6f42c1', '#d63384', '#fd7e14', '#20c997'
+                ]
 
-            # ===== RECENT ACTIVITIES =====
-            cur.execute("""
-                SELECT 
-                    dh.created_at,
-                    u.username,
-                    CONCAT('Diagnosed ', dh.disease_detected, ' on ', dh.crop) as action,
-                    u.id as user_id
-                FROM diagnosis_history dh
-                JOIN users u ON dh.user_id = u.id
-                ORDER BY dh.created_at DESC
-                LIMIT 10
-            """)
-            recent_activities = cur.fetchall()
+                # Add colors to recent_activities
+                for i, activity in enumerate(recent_activities):
+                    activity['avatar_color'] = avatar_colors[i % len(avatar_colors)]
 
-            # ===== ADD AVATAR COLORS =====
-            avatar_colors = [
-                '#0d6efd', '#198754', '#dc3545', '#ffc107', '#0dcaf0',
-                '#6610f2', '#6f42c1', '#d63384', '#fd7e14', '#20c997'
-            ]
+                # ===== SIDEBAR STATS =====
+                # Get pending users count (inactive users)
+                cur.execute("SELECT COUNT(*) as count FROM users WHERE is_active = FALSE")
+                pending_users = cur.fetchone()['count'] or 0
 
-            # Add colors to recent_activities
-            for i, activity in enumerate(recent_activities):
-                activity['avatar_color'] = avatar_colors[i % len(avatar_colors)]
+                sidebar_stats = {
+                    'pending_users': pending_users,
+                    'pending_feedback': feedback_stats['pending_feedback'] or 0
+                }
 
-            # ===== SIDEBAR STATS =====
-            # Get pending users count (inactive users)
-            cur.execute("SELECT COUNT(*) as count FROM users WHERE is_active = 0")
-            pending_users = cur.fetchone()['count'] or 0
+                # ===== SYSTEM HEALTH SCORE =====
+                health_score = 0.0
+                health_factors = []
 
-            sidebar_stats = {
-                'pending_users': pending_users,
-                'pending_feedback': feedback_stats['pending_feedback']
-            }
+                # Factor 1: User engagement (30%)
+                if user_stats['total_users'] > 0:
+                    engagement_rate = (active_today / user_stats['total_users']) * 100
+                    engagement_score = min(30.0, (engagement_rate / 10) * 3)
+                    health_factors.append({'factor': 'User Engagement', 'score': round(engagement_score, 1), 'max': 30})
+                    health_score += engagement_score
 
-            # ===== SYSTEM HEALTH SCORE =====
-            health_score = 0.0
-            health_factors = []
+                # Factor 2: Diagnosis activity (30%)
+                if total_diagnoses > 0:
+                    activity_score = min(30.0, (total_diagnoses / 50) * 15)
+                    health_factors.append({'factor': 'Diagnosis Activity', 'score': round(activity_score, 1), 'max': 30})
+                    health_score += activity_score
 
-            # Factor 1: User engagement (30%)
-            if user_stats['total_users'] > 0:
-                engagement_rate = (active_today / user_stats['total_users']) * 100
-                engagement_score = min(30.0, (engagement_rate / 10) * 3)
-                health_factors.append({'factor': 'User Engagement', 'score': round(engagement_score, 1), 'max': 30})
-                health_score += engagement_score
+                # Factor 3: Disease coverage (20%)
+                if total_diseases > 0:
+                    coverage_score = min(20.0, total_diseases * 2)
+                    health_factors.append({'factor': 'Disease Coverage', 'score': round(coverage_score, 1), 'max': 20})
+                    health_score += coverage_score
 
-            # Factor 2: Diagnosis activity (30%)
-            if total_diagnoses > 0:
-                activity_score = min(30.0, (total_diagnoses / 50) * 15)
-                health_factors.append({'factor': 'Diagnosis Activity', 'score': round(activity_score, 1), 'max': 30})
-                health_score += activity_score
+                # Factor 4: Feedback response (20%)
+                if feedback_stats['total_feedback'] > 0:
+                    resolution_rate = (feedback_stats['resolved_feedback'] / feedback_stats['total_feedback']) * 100
+                    feedback_score = min(20.0, (resolution_rate / 100) * 20)
+                    health_factors.append(
+                        {'factor': 'Feedback Resolution', 'score': round(feedback_score, 1), 'max': 20})
+                    health_score += feedback_score
 
-            # Factor 3: Disease coverage (20%)
-            if total_diseases > 0:
-                coverage_score = min(20.0, total_diseases * 2)
-                health_factors.append({'factor': 'Disease Coverage', 'score': round(coverage_score, 1), 'max': 20})
-                health_score += coverage_score
-
-            # Factor 4: Feedback response (20%)
-            if feedback_stats['total_feedback'] > 0:
-                resolution_rate = (feedback_stats['resolved_feedback'] / feedback_stats['total_feedback']) * 100
-                feedback_score = min(20.0, (resolution_rate / 100) * 20)
-                health_factors.append(
-                    {'factor': 'Feedback Resolution', 'score': round(feedback_score, 1), 'max': 20})
-                health_score += feedback_score
-
-            health_score = round(health_score, 1)
+                health_score = round(health_score, 1)
 
             return render_template("admin/dashboard.html",
                                    user_stats=user_stats,
                                    active_today=active_today,
                                    avg_confidence=avg_confidence,
-                                   confidence_stats=confidence_stats,
-                                   accuracy_stats=accuracy_stats,
                                    total_diagnoses=total_diagnoses,
                                    monthly_diagnoses=monthly_diagnoses,
                                    total_diseases=total_diseases,
@@ -2035,22 +1767,13 @@ def register_user_routes(app):
             traceback.print_exc()
             flash('Error loading admin dashboard', 'danger')
             return redirect(url_for('dashboard'))
-        finally:
-            if cur: cur.close()
-            if db: db.close()
 
     # ========== ADMIN USER MANAGEMENT ==========
     @app.route("/admin/users")
     @admin_required
     def admin_users():
         """Admin - User management with CRUD operations"""
-        db = None
-        cur = None
-
         try:
-            db = get_db()
-            cur = db.cursor(dictionary=True)
-
             # Get page and filters
             page = int(request.args.get('page', 1))
             per_page = 10
@@ -2060,79 +1783,83 @@ def register_user_routes(app):
             status = request.args.get('status', '')
             search = request.args.get('search', '')
 
-            # Build query with filters
-            query = "SELECT * FROM users WHERE 1=1"
-            count_query = "SELECT COUNT(*) as total FROM users WHERE 1=1"
-            params = []
+            with get_db_cursor_readonly() as cur:
+                # Build query with filters
+                query = "SELECT * FROM users WHERE 1=1"
+                count_query = "SELECT COUNT(*) as total FROM users WHERE 1=1"
+                params = []
+                count_params = []
 
-            if user_type:
-                query += " AND user_type = %s"
-                count_query += " AND user_type = %s"
-                params.append(user_type)
+                if user_type:
+                    query += " AND user_type = %s"
+                    count_query += " AND user_type = %s"
+                    params.append(user_type)
+                    count_params.append(user_type)
 
-            if status == 'active':
-                query += " AND is_active = 1"
-                count_query += " AND is_active = 1"
-            elif status == 'inactive':
-                query += " AND is_active = 0"
-                count_query += " AND is_active = 0"
+                if status == 'active':
+                    query += " AND is_active = TRUE"
+                    count_query += " AND is_active = TRUE"
+                elif status == 'inactive':
+                    query += " AND is_active = FALSE"
+                    count_query += " AND is_active = FALSE"
 
-            if search:
-                query += " AND (username LIKE %s OR email LIKE %s OR full_name LIKE %s)"
-                count_query += " AND (username LIKE %s OR email LIKE %s OR full_name LIKE %s)"
-                search_param = f"%{search}%"
-                params.extend([search_param, search_param, search_param])
+                if search:
+                    query += " AND (username ILIKE %s OR email ILIKE %s OR full_name ILIKE %s)"
+                    count_query += " AND (username ILIKE %s OR email ILIKE %s OR full_name ILIKE %s)"
+                    search_param = f"%{search}%"
+                    params.extend([search_param, search_param, search_param])
+                    count_params.extend([search_param, search_param, search_param])
 
-            # Get total count
-            cur.execute(count_query, params)
-            total_users = cur.fetchone()['total'] or 0
-            total_pages = (total_users + per_page - 1) // per_page
+                # Get total count
+                cur.execute(count_query, count_params)
+                total_users = cur.fetchone()['total'] or 0
+                total_pages = (total_users + per_page - 1) // per_page if total_users > 0 else 1
 
-            # Add pagination
-            query += " ORDER BY created_at DESC LIMIT %s OFFSET %s"
-            pagination_params = params + [per_page, offset]
+                # Add pagination
+                query += " ORDER BY created_at DESC LIMIT %s OFFSET %s"
+                pagination_params = params + [per_page, offset]
 
-            cur.execute(query, pagination_params)
-            users = cur.fetchall()
+                cur.execute(query, pagination_params)
+                users = cur.fetchall()
 
-            # Get statistics for cards
-            cur.execute("""
-                SELECT 
-                    COUNT(*) as total_users,
-                    SUM(CASE WHEN user_type = 'farmer' THEN 1 ELSE 0 END) as farmers,
-                    SUM(CASE WHEN user_type = 'expert' THEN 1 ELSE 0 END) as experts,
-                    SUM(CASE WHEN user_type = 'researcher' THEN 1 ELSE 0 END) as researchers,
-                    SUM(CASE WHEN user_type = 'student' THEN 1 ELSE 0 END) as students,
-                    SUM(CASE WHEN user_type = 'admin' THEN 1 ELSE 0 END) as admins,
-                    SUM(CASE WHEN DATE(last_login) = CURDATE() THEN 1 ELSE 0 END) as active_today,
-                    SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END) as active_users,
-                    SUM(CASE WHEN is_active = 0 THEN 1 ELSE 0 END) as inactive_users
-                FROM users
-            """)
-            stats = cur.fetchone()
+                # Get statistics for cards
+                cur.execute("""
+                    SELECT 
+                        COUNT(*) as total_users,
+                        SUM(CASE WHEN user_type = 'farmer' THEN 1 ELSE 0 END) as farmers,
+                        SUM(CASE WHEN user_type = 'expert' THEN 1 ELSE 0 END) as experts,
+                        SUM(CASE WHEN user_type = 'researcher' THEN 1 ELSE 0 END) as researchers,
+                        SUM(CASE WHEN user_type = 'student' THEN 1 ELSE 0 END) as students,
+                        SUM(CASE WHEN user_type = 'admin' THEN 1 ELSE 0 END) as admins,
+                        SUM(CASE WHEN DATE(last_login) = CURRENT_DATE THEN 1 ELSE 0 END) as active_today,
+                        SUM(CASE WHEN is_active = TRUE THEN 1 ELSE 0 END) as active_users,
+                        SUM(CASE WHEN is_active = FALSE THEN 1 ELSE 0 END) as inactive_users
+                    FROM users
+                """)
+                stats = cur.fetchone()
 
-            # Get pending counts
-            cur.execute("SELECT COUNT(*) as count FROM feedback WHERE status = 'pending'")
-            pending_feedback = cur.fetchone()['count'] or 0
+                # Get pending counts
+                cur.execute("SELECT COUNT(*) as count FROM feedback WHERE status = 'pending'")
+                pending_feedback = cur.fetchone()['count'] or 0
 
-            # Get pending diseases count (if you have a disease_info table with status)
-            try:
-                cur.execute("SELECT COUNT(*) as count FROM disease_info WHERE status = 'pending'")
-                pending_diseases = cur.fetchone()['count'] or 0
-            except:
-                pending_diseases = 0
+                # Get pending diseases count
+                try:
+                    cur.execute("SELECT COUNT(*) as count FROM disease_info WHERE status = 'pending'")
+                    pending_diseases = cur.fetchone()['count'] or 0
+                except:
+                    pending_diseases = 0
 
-            # Get pending reviews count
-            cur.execute("SELECT COUNT(*) as count FROM diagnosis_history WHERE expert_review_status = 'pending'")
-            pending_reviews = cur.fetchone()['count'] or 0
+                # Get pending reviews count
+                cur.execute("SELECT COUNT(*) as count FROM diagnosis_history WHERE expert_review_status = 'pending'")
+                pending_reviews = cur.fetchone()['count'] or 0
 
-            # Create sidebar stats with ALL needed fields
-            sidebar_stats = {
-                'pending_users': stats['inactive_users'] if stats else 0,
-                'pending_feedback': pending_feedback,
-                'pending_diseases': pending_diseases,
-                'pending_reviews': pending_reviews  # ← ADD THIS
-            }
+                # Create sidebar stats
+                sidebar_stats = {
+                    'pending_users': stats['inactive_users'] if stats else 0,
+                    'pending_feedback': pending_feedback,
+                    'pending_diseases': pending_diseases,
+                    'pending_reviews': pending_reviews
+                }
 
             # Build filter params for pagination
             filter_params = ''
@@ -2159,17 +1886,11 @@ def register_user_routes(app):
             traceback.print_exc()
             flash('Error loading users', 'danger')
             return redirect(url_for('admin_dashboard'))
-        finally:
-            if cur: cur.close()
-            if db: db.close()
 
     @app.route("/admin/user/create", methods=["POST"])
     @admin_required
     def admin_create_user():
         """Admin - Create new user"""
-        db = None
-        cur = None
-
         try:
             username = request.form.get('username')
             email = request.form.get('email')
@@ -2179,54 +1900,37 @@ def register_user_routes(app):
             phone = request.form.get('phone')
             location = request.form.get('location')
 
-            db = get_db()
-            cur = db.cursor(dictionary=True)
-
-            # Check if user exists
-            cur.execute("SELECT id FROM users WHERE username = %s OR email = %s", (username, email))
-            if cur.fetchone():
-                flash('Username or email already exists!', 'danger')
-                return redirect(url_for('admin_users'))
+            with get_db_cursor_readonly() as cur:
+                # Check if user exists
+                cur.execute("SELECT id FROM users WHERE username = %s OR email = %s", (username, email))
+                if cur.fetchone():
+                    flash('Username or email already exists!', 'danger')
+                    return redirect(url_for('admin_users'))
 
             # Create user
             password_hash = hash_password(password)
-            cur.execute("""
-                INSERT INTO users (username, email, password_hash, full_name, user_type, 
-                                  phone_number, location, is_active, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, 1, NOW())
-            """, (username, email, password_hash, full_name, user_type, phone, location))
-
-            user_id = cur.lastrowid
-
-            # Create default settings
-            try:
+            with get_db_cursor() as cur:
                 cur.execute("""
-                    INSERT INTO user_settings (user_id) VALUES (%s)
-                """, (user_id,))
-            except:
-                pass  # Settings table might not exist
+                    INSERT INTO users (username, email, password_hash, full_name, user_type, 
+                                      phone_number, location, is_active, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE, NOW())
+                    RETURNING id
+                """, (username, email, password_hash, full_name, user_type, phone, location))
+                user_id = cur.fetchone()['id']
 
-            db.commit()
-
-            # Log activity (if table exists)
-            try:
-                cur.execute("""
-                    INSERT INTO activity_logs (user_id, action, entity_type, entity_id, ip_address, created_at)
-                    VALUES (%s, %s, %s, %s, %s, NOW())
-                """, (session['user_id'], f"Created user: {username}", 'user', user_id, request.remote_addr))
-                db.commit()
-            except:
-                pass
+                # Create default settings
+                try:
+                    cur.execute("""
+                        INSERT INTO user_settings (user_id) VALUES (%s)
+                    """, (user_id,))
+                except:
+                    pass  # Settings table might not exist
 
             flash(f'User {username} created successfully!', 'success')
 
         except Exception as e:
             print(f"Create user error: {e}")
-            if db: db.rollback()
             flash('Error creating user', 'danger')
-        finally:
-            if cur: cur.close()
-            if db: db.close()
 
         return redirect(url_for('admin_users'))
 
@@ -2234,35 +1938,25 @@ def register_user_routes(app):
     @admin_required
     def admin_update_user(user_id):
         """Admin - Update user details"""
-        db = None
-        cur = None
-
         try:
             full_name = request.form.get('full_name')
             phone = request.form.get('phone')
             location = request.form.get('location')
             user_type = request.form.get('user_type')
 
-            db = get_db()
-            cur = db.cursor()
-
-            cur.execute("""
-                UPDATE users 
-                SET full_name = %s, phone_number = %s, location = %s, 
-                    user_type = %s, updated_at = NOW()
-                WHERE id = %s
-            """, (full_name, phone, location, user_type, user_id))
-
-            db.commit()
+            with get_db_cursor() as cur:
+                cur.execute("""
+                    UPDATE users 
+                    SET full_name = %s, phone_number = %s, location = %s, 
+                        user_type = %s, updated_at = NOW()
+                    WHERE id = %s
+                """, (full_name, phone, location, user_type, user_id))
 
             flash('User updated successfully!', 'success')
 
         except Exception as e:
             print(f"Update user error: {e}")
             flash('Error updating user', 'danger')
-        finally:
-            if cur: cur.close()
-            if db: db.close()
 
         return redirect(url_for('admin_users'))
 
@@ -2270,134 +1964,104 @@ def register_user_routes(app):
     @admin_required
     def admin_toggle_user_status(user_id):
         """Admin - Activate/Deactivate user"""
-        db = None
-        cur = None
-
         try:
-            db = get_db()
-            cur = db.cursor(dictionary=True)
+            with get_db_cursor_readonly() as cur:
+                # Get current status
+                cur.execute("SELECT username, is_active FROM users WHERE id = %s", (user_id,))
+                user = cur.fetchone()
 
-            # Get current status
-            cur.execute("SELECT username, is_active FROM users WHERE id = %s", (user_id,))
-            user = cur.fetchone()
-
-            if not user:
-                return jsonify({'success': False, 'error': 'User not found'}), 404
+                if not user:
+                    return jsonify({'success': False, 'error': 'User not found'}), 404
 
             # Toggle status
             new_status = not user['is_active']
-            cur.execute("UPDATE users SET is_active = %s, updated_at = NOW() WHERE id = %s",
-                        (new_status, user_id))
-            db.commit()
+            with get_db_cursor() as cur:
+                cur.execute("UPDATE users SET is_active = %s, updated_at = NOW() WHERE id = %s",
+                            (new_status, user_id))
 
             return jsonify({'success': True, 'is_active': new_status})
 
         except Exception as e:
             print(f"Toggle user status error: {e}")
             return jsonify({'success': False, 'error': str(e)}), 500
-        finally:
-            if cur: cur.close()
-            if db: db.close()
 
     @app.route("/admin/user/<int:user_id>/delete", methods=["POST"])
     @admin_required
     def admin_delete_user(user_id):
         """Admin - Delete user"""
-        db = None
-        cur = None
-
         try:
-            db = get_db()
-            cur = db.cursor(dictionary=True)
+            with get_db_cursor_readonly() as cur:
+                # Get username
+                cur.execute("SELECT username FROM users WHERE id = %s", (user_id,))
+                user = cur.fetchone()
 
-            # Get username
-            cur.execute("SELECT username FROM users WHERE id = %s", (user_id,))
-            user = cur.fetchone()
+                if not user:
+                    return jsonify({'success': False, 'error': 'User not found'}), 404
 
-            if not user:
-                return jsonify({'success': False, 'error': 'User not found'}), 404
-
-            # Don't allow deleting own account
-            if user_id == session['user_id']:
-                return jsonify({'success': False, 'error': 'Cannot delete your own account'}), 400
+                # Don't allow deleting own account
+                if user_id == session['user_id']:
+                    return jsonify({'success': False, 'error': 'Cannot delete your own account'}), 400
 
             # Delete user settings first
             try:
-                cur.execute("DELETE FROM user_settings WHERE user_id = %s", (user_id,))
+                with get_db_cursor() as cur:
+                    cur.execute("DELETE FROM user_settings WHERE user_id = %s", (user_id,))
             except:
                 pass
 
             # Delete user
-            cur.execute("DELETE FROM users WHERE id = %s", (user_id,))
-            db.commit()
+            with get_db_cursor() as cur:
+                cur.execute("DELETE FROM users WHERE id = %s", (user_id,))
 
             return jsonify({'success': True})
 
         except Exception as e:
             print(f"Delete user error: {e}")
             return jsonify({'success': False, 'error': str(e)}), 500
-        finally:
-            if cur: cur.close()
-            if db: db.close()
 
     @app.route("/api/admin/user/<int:user_id>")
     @admin_required
     def admin_get_user(user_id):
         """API - Get user details"""
-        db = None
-        cur = None
-
         try:
-            db = get_db()
-            cur = db.cursor(dictionary=True)
-
-            cur.execute("""
-                SELECT id, username, email, full_name, user_type, 
-                       phone_number as phone, location, profile_image,
-                       is_active, created_at, last_login
-                FROM users 
-                WHERE id = %s
-            """, (user_id,))
-
-            user = cur.fetchone()
+            with get_db_cursor_readonly() as cur:
+                cur.execute("""
+                    SELECT id, username, email, full_name, user_type, 
+                           phone_number as phone, location, profile_image,
+                           is_active, created_at, last_login
+                    FROM users 
+                    WHERE id = %s
+                """, (user_id,))
+                user = cur.fetchone()
 
             if not user:
                 return jsonify({'error': 'User not found'}), 404
 
             # Format dates
             if user['created_at']:
-                user['created_at'] = user['created_at'].strftime('%Y-%m-%d %H:%M:%S')
+                user['created_at'] = user['created_at'].strftime('%Y-%m-%d %H:%M:%S') if hasattr(user['created_at'], 'strftime') else str(user['created_at'])
             if user['last_login']:
-                user['last_login'] = user['last_login'].strftime('%Y-%m-%d %H:%M:%S')
+                user['last_login'] = user['last_login'].strftime('%Y-%m-%d %H:%M:%S') if hasattr(user['last_login'], 'strftime') else str(user['last_login'])
 
             return jsonify(user)
 
         except Exception as e:
             print(f"Get user error: {e}")
             return jsonify({'error': str(e)}), 500
-        finally:
-            if cur: cur.close()
-            if db: db.close()
 
     @app.route("/admin/users/export")
     @admin_required
     def admin_export_users():
         """Admin - Export users to CSV"""
-        db = None
-        cur = None
-
         try:
-            db = get_db()
-            cur = db.cursor(dictionary=True)
-
-            cur.execute("""
-                SELECT id, username, email, full_name, user_type, 
-                       phone_number, location, is_active, created_at, last_login
-                FROM users
-                ORDER BY created_at DESC
-            """)
-
-            users = cur.fetchall()
+            with get_db_cursor_readonly() as cur:
+                cur.execute("""
+                    SELECT id, username, email, full_name, user_type, 
+                           phone_number, location, is_active, created_at, last_login
+                    FROM users
+                    ORDER BY created_at DESC
+                """)
+                users = cur.fetchall()
 
             # Create CSV
             output = StringIO()
@@ -2436,85 +2100,77 @@ def register_user_routes(app):
             print(f"Export users error: {e}")
             flash('Error exporting users', 'danger')
             return redirect(url_for('admin_users'))
-        finally:
-            if cur: cur.close()
-            if db: db.close()
 
-            # ========== ADMIN FEEDBACK MANAGEMENT ==========
+    # ========== ADMIN FEEDBACK MANAGEMENT ==========
 
     @app.route('/admin/feedback')
     @admin_required
     def admin_feedback():
         """Admin view to see all feedback"""
         try:
-            db = get_db()
-            cur = db.cursor(dictionary=True)
+            with get_db_cursor_readonly() as cur:
+                # Get filter parameters
+                status = request.args.get('status', '')
+                category = request.args.get('category', '')
+                search = request.args.get('search', '')
 
-            # Get filter parameters
-            status = request.args.get('status', '')
-            category = request.args.get('category', '')
-            search = request.args.get('search', '')
+                # Base query
+                query = """
+                    SELECT f.*, u.username, u.full_name, u.email, u.user_type
+                    FROM feedback f
+                    LEFT JOIN users u ON f.user_id = u.id
+                    WHERE 1=1
+                """
+                params = []
 
-            # Base query
-            query = """
-                SELECT f.*, u.username, u.full_name, u.email, u.user_type
-                FROM feedback f
-                LEFT JOIN users u ON f.user_id = u.id
-                WHERE 1=1
-            """
-            params = []
+                # Add filters
+                if status:
+                    query += " AND f.status = %s"
+                    params.append(status)
 
-            # Add filters
-            if status:
-                query += " AND f.status = %s"
-                params.append(status)
+                if category:
+                    query += " AND f.feedback_type = %s"
+                    params.append(category)
 
-            if category:
-                query += " AND f.feedback_type = %s"
-                params.append(category)
+                if search:
+                    query += " AND (f.subject ILIKE %s OR f.message ILIKE %s OR f.name ILIKE %s OR f.email ILIKE %s)"
+                    search_term = f"%{search}%"
+                    params.extend([search_term, search_term, search_term, search_term])
 
-            if search:
-                query += " AND (f.subject LIKE %s OR f.message LIKE %s OR f.name LIKE %s OR f.email LIKE %s)"
-                search_term = f"%{search}%"
-                params.extend([search_term, search_term, search_term, search_term])
+                query += " ORDER BY f.created_at DESC"
 
-            query += " ORDER BY f.created_at DESC"
+                cur.execute(query, params)
+                feedback_list = cur.fetchall()
 
-            cur.execute(query, params)
-            feedback_list = cur.fetchall()
+                # Get unique categories for filter dropdown
+                cur.execute("SELECT DISTINCT feedback_type FROM feedback")
+                category_rows = cur.fetchall()
+                categories = [row['feedback_type'] for row in category_rows if row['feedback_type']]
 
-            # Get unique categories for filter dropdown
-            cur.execute("SELECT DISTINCT feedback_type FROM feedback")
-            category_rows = cur.fetchall()
-            categories = [row['feedback_type'] for row in category_rows if row['feedback_type']]
+                # Get sidebar stats
+                cur.execute("SELECT COUNT(*) as count FROM users WHERE is_active = FALSE")
+                pending_users = cur.fetchone()['count'] or 0
 
-            # Get sidebar stats
-            cur.execute("SELECT COUNT(*) as count FROM users WHERE is_active = 0")
-            pending_users = cur.fetchone()['count'] or 0
+                cur.execute("SELECT COUNT(*) as count FROM feedback WHERE status = 'pending'")
+                pending_feedback = cur.fetchone()['count'] or 0
 
-            cur.execute("SELECT COUNT(*) as count FROM feedback WHERE status = 'pending'")
-            pending_feedback = cur.fetchone()['count'] or 0
+                # Get pending diseases count
+                try:
+                    cur.execute("SELECT COUNT(*) as count FROM disease_info WHERE status = 'pending'")
+                    pending_diseases = cur.fetchone()['count'] or 0
+                except:
+                    pending_diseases = 0
 
-            # Get pending diseases count
-            try:
-                cur.execute("SELECT COUNT(*) as count FROM disease_info WHERE status = 'pending'")
-                pending_diseases = cur.fetchone()['count'] or 0
-            except:
-                pending_diseases = 0
+                # Get pending reviews count
+                cur.execute("SELECT COUNT(*) as count FROM diagnosis_history WHERE expert_review_status = 'pending'")
+                pending_reviews = cur.fetchone()['count'] or 0
 
-            # Get pending reviews count
-            cur.execute("SELECT COUNT(*) as count FROM diagnosis_history WHERE expert_review_status = 'pending'")
-            pending_reviews = cur.fetchone()['count'] or 0
-
-            sidebar_stats = {
-                'pending_users': pending_users,
-                'pending_feedback': pending_feedback,
-                'pending_diseases': pending_diseases,
-                'pending_reviews': pending_reviews  # ← ADD THIS
-            }
-
-            cur.close()
-            db.close()
+                sidebar_stats = {
+                    'pending_users': pending_users,
+                    'pending_feedback': pending_feedback,
+                    'pending_diseases': pending_diseases,
+                    'pending_reviews': pending_reviews
+                }
 
             return render_template('admin/feedback.html',
                                    feedback=feedback_list,
@@ -2523,71 +2179,6 @@ def register_user_routes(app):
                                    current_category=category,
                                    current_search=search,
                                    sidebar_stats=sidebar_stats)
-
-        except Exception as e:
-            print(f"Error loading feedback: {e}")
-            import traceback
-            traceback.print_exc()
-            flash('Error loading feedback', 'error')
-            return redirect(url_for('admin_dashboard'))
-    def admin_feedback():
-        """Admin view to see all feedback"""
-        # Check if user is admin
-        if session.get('user_type') != 'admin':
-            flash('Unauthorized access', 'error')
-            return redirect(url_for('dashboard'))
-
-        try:
-            db = get_db()
-            cur = db.cursor(dictionary=True)
-
-            # Get filter parameters
-            status = request.args.get('status', '')
-            category = request.args.get('category', '')
-            search = request.args.get('search', '')
-
-            # Base query - REMOVED diagnosis_history JOIN
-            query = """
-                SELECT f.*, u.username, u.full_name, u.email, u.user_type
-                FROM feedback f
-                LEFT JOIN users u ON f.user_id = u.id
-                WHERE 1=1
-            """
-            params = []
-
-            # Add filters
-            if status:
-                query += " AND f.status = %s"
-                params.append(status)
-
-            if category:
-                query += " AND f.feedback_type = %s"
-                params.append(category)
-
-            if search:
-                query += " AND (f.subject LIKE %s OR f.message LIKE %s OR f.name LIKE %s OR f.email LIKE %s)"
-                search_term = f"%{search}%"
-                params.extend([search_term, search_term, search_term, search_term])
-
-            query += " ORDER BY f.created_at DESC"
-
-            cur.execute(query, params)
-            feedback_list = cur.fetchall()
-
-            # Get unique categories for filter dropdown
-            cur.execute("SELECT DISTINCT feedback_type FROM feedback")
-            category_rows = cur.fetchall()
-            categories = [row['feedback_type'] for row in category_rows if row['feedback_type']]
-
-            cur.close()
-            db.close()
-
-            return render_template('admin/feedback.html',
-                                   feedback=feedback_list,
-                                   categories=categories,
-                                   current_status=status,
-                                   current_category=category,
-                                   current_search=search)
 
         except Exception as e:
             print(f"Error loading feedback: {e}")
@@ -2604,22 +2195,16 @@ def register_user_routes(app):
         if session.get('user_type') != 'admin':
             return jsonify({'error': 'Unauthorized access'}), 401
 
-        db = None
-        cur = None
-
         try:
-            db = get_db()
-            cur = db.cursor(dictionary=True)
+            with get_db_cursor_readonly() as cur:
+                cur.execute("""
+                    SELECT f.*, u.username, u.full_name, u.email, u.user_type
+                    FROM feedback f
+                    LEFT JOIN users u ON f.user_id = u.id
+                    WHERE f.id = %s
+                """, (feedback_id,))
 
-            # REMOVED the diagnosis_history JOIN since the column doesn't exist
-            cur.execute("""
-                SELECT f.*, u.username, u.full_name, u.email, u.user_type
-                FROM feedback f
-                LEFT JOIN users u ON f.user_id = u.id
-                WHERE f.id = %s
-            """, (feedback_id,))
-
-            feedback = cur.fetchone()
+                feedback = cur.fetchone()
 
             if not feedback:
                 return jsonify({'error': 'Feedback not found'}), 404
@@ -2637,9 +2222,6 @@ def register_user_routes(app):
             import traceback
             traceback.print_exc()
             return jsonify({'error': str(e)}), 500
-        finally:
-            if cur: cur.close()
-            if db: db.close()
 
     @app.route("/admin/feedback/<int:feedback_id>/reply", methods=["POST"])
     @login_required
@@ -2649,9 +2231,6 @@ def register_user_routes(app):
         if session.get('user_type') != 'admin':
             return jsonify({'success': False, 'error': 'Unauthorized access'}), 401
 
-        db = None
-        cur = None
-
         try:
             data = request.get_json()
             reply = data.get('reply', '').strip()
@@ -2659,28 +2238,18 @@ def register_user_routes(app):
             if not reply:
                 return jsonify({'success': False, 'error': 'Reply cannot be empty'}), 400
 
-            db = get_db()
-            cur = db.cursor()
-
-            # Only update admin_response - DO NOT change status
-            cur.execute("""
-                UPDATE feedback 
-                SET admin_response = %s
-                WHERE id = %s
-            """, (reply, feedback_id))
-
-            db.commit()
+            with get_db_cursor() as cur:
+                cur.execute("""
+                    UPDATE feedback 
+                    SET admin_response = %s
+                    WHERE id = %s
+                """, (reply, feedback_id))
 
             return jsonify({'success': True, 'message': 'Reply saved successfully'})
 
         except Exception as e:
             print(f"Reply feedback error: {e}")
-            if db:
-                db.rollback()
             return jsonify({'success': False, 'error': str(e)}), 500
-        finally:
-            if cur: cur.close()
-            if db: db.close()
 
     @app.route("/admin/feedback/<int:feedback_id>/status", methods=["POST"])
     @login_required
@@ -2690,9 +2259,6 @@ def register_user_routes(app):
         if session.get('user_type') != 'admin':
             return jsonify({'success': False, 'error': 'Unauthorized access'}), 401
 
-        db = None
-        cur = None
-
         try:
             data = request.get_json()
             status = data.get('status')
@@ -2700,43 +2266,32 @@ def register_user_routes(app):
             if status not in ['pending', 'reviewed', 'resolved']:
                 return jsonify({'success': False, 'error': 'Invalid status'}), 400
 
-            db = get_db()
-            cur = db.cursor()
-
-            # Update only the status
-            cur.execute("""
-                UPDATE feedback 
-                SET status = %s
-                WHERE id = %s
-            """, (status, feedback_id))
-
-            db.commit()
+            with get_db_cursor() as cur:
+                cur.execute("""
+                    UPDATE feedback 
+                    SET status = %s
+                    WHERE id = %s
+                """, (status, feedback_id))
 
             return jsonify({'success': True})
 
         except Exception as e:
             print(f"Update feedback status error: {e}")
             return jsonify({'success': False, 'error': str(e)}), 500
-        finally:
-            if cur: cur.close()
-            if db: db.close()
 
     @app.route('/admin/clean-all-paths')
     @admin_required
     def clean_all_image_paths():
         """Clean up all image paths in database to just filenames"""
         try:
-            db = get_db()
-            cursor = db.cursor()
-
-            # Get all records with image paths
-            cursor.execute("SELECT id, image_path FROM diagnosis_history WHERE image_path IS NOT NULL")
-            records = cursor.fetchall()
+            with get_db_cursor_readonly() as cur:
+                cur.execute("SELECT id, image_path FROM diagnosis_history WHERE image_path IS NOT NULL")
+                records = cur.fetchall()
 
             updated = 0
             for record in records:
-                record_id = record[0]
-                image_path = record[1]
+                record_id = record['id']
+                image_path = record['image_path']
 
                 if image_path:
                     # Extract just the filename
@@ -2744,19 +2299,17 @@ def register_user_routes(app):
 
                     # Only update if it's different
                     if filename != image_path:
-                        cursor.execute("UPDATE diagnosis_history SET image_path = %s WHERE id = %s",
-                                       (filename, record_id))
+                        with get_db_cursor() as update_cur:
+                            update_cur.execute("UPDATE diagnosis_history SET image_path = %s WHERE id = %s",
+                                           (filename, record_id))
                         updated += 1
                         print(f"Updated ID {record_id}: {image_path} -> {filename}")
-
-            db.commit()
-            cursor.close()
-            db.close()
 
             return f"✅ Cleaned up {updated} records. All image paths are now simple filenames."
 
         except Exception as e:
             return f"Error: {str(e)}"
+
     # ========== SETTINGS ROUTES ==========
 
     @app.route('/settings', methods=['GET', 'POST'])
@@ -2768,48 +2321,42 @@ def register_user_routes(app):
         if not user_id:
             return redirect(url_for('login'))
 
-        db = get_db()
-        cursor = db.cursor(dictionary=True)
-
-        # Get user information
-        cursor.execute("""
-            SELECT id, username, email, full_name, phone_number, 
-                   location, profile_image, user_type, is_active, 
-                   created_at, last_login, bio, language
-            FROM users WHERE id = %s
-        """, (user_id,))
-        user = cursor.fetchone()
-
-        if not user:
-            return redirect(url_for('login'))
-
-        # Get user settings
-        cursor.execute("SELECT * FROM user_settings WHERE user_id = %s", (user_id,))
-        settings_data = cursor.fetchone()
-
-        # If no settings exist, create default settings
-        if not settings_data:
-            cursor.execute("""
-                INSERT INTO user_settings (user_id) VALUES (%s)
+        with get_db_cursor_readonly() as cur:
+            # Get user information
+            cur.execute("""
+                SELECT id, username, email, full_name, phone_number, 
+                       location, profile_image, user_type, is_active, 
+                       created_at, last_login, bio, language
+                FROM users WHERE id = %s
             """, (user_id,))
-            db.commit()
+            user = cur.fetchone()
 
-            cursor.execute("SELECT * FROM user_settings WHERE user_id = %s", (user_id,))
-            settings_data = cursor.fetchone()
+            if not user:
+                return redirect(url_for('login'))
 
-        # Get account statistics
-        cursor.execute("""
-            SELECT 
-                created_at,
-                last_login,
-                (SELECT COUNT(*) FROM diagnosis_history WHERE user_id = %s) as total_diagnosis,
-                0 as saved_items
-            FROM users WHERE id = %s
-        """, (user_id, user_id))
-        stats = cursor.fetchone()
+            # Get user settings
+            cur.execute("SELECT * FROM user_settings WHERE user_id = %s", (user_id,))
+            settings_data = cur.fetchone()
 
-        cursor.close()
-        db.close()
+            # If no settings exist, create default settings
+            if not settings_data:
+                with get_db_cursor() as insert_cur:
+                    insert_cur.execute("""
+                        INSERT INTO user_settings (user_id) VALUES (%s)
+                        RETURNING *
+                    """, (user_id,))
+                    settings_data = insert_cur.fetchone()
+
+            # Get account statistics
+            cur.execute("""
+                SELECT 
+                    created_at,
+                    last_login,
+                    (SELECT COUNT(*) FROM diagnosis_history WHERE user_id = %s) as total_diagnosis,
+                    COALESCE((SELECT COUNT(*) FROM saved_diagnoses WHERE user_id = %s), 0) as saved_items
+                FROM users WHERE id = %s
+            """, (user_id, user_id, user_id))
+            stats = cur.fetchone()
 
         # Handle form submissions
         if request.method == 'POST':
@@ -2849,37 +2396,29 @@ def register_user_routes(app):
         new_password = form_data.get('new_password')
         confirm_password = form_data.get('confirm_password')
 
-        db = get_db()
-        cursor = db.cursor(dictionary=True)
+        with get_db_cursor_readonly() as cur:
+            # Update email
+            cur.execute("UPDATE users SET email = %s WHERE id = %s", (email, user_id))
 
-        # Update email
-        cursor.execute("UPDATE users SET email = %s WHERE id = %s", (email, user_id))
+            # Handle password change if provided
+            if current_password and new_password and confirm_password:
+                # Verify current password
+                cur.execute("SELECT password_hash FROM users WHERE id = %s", (user_id,))
+                user = cur.fetchone()
 
-        # Handle password change if provided
-        if current_password and new_password and confirm_password:
-            # Verify current password
-            cursor.execute("SELECT password_hash FROM users WHERE id = %s", (user_id,))
-            user = cursor.fetchone()
-
-            from auth import check_password_hash
-            if user and check_password_hash(user['password_hash'], current_password):
-                if new_password == confirm_password:
-                    from auth import generate_password_hash
-                    hashed_password = generate_password_hash(new_password)
-                    cursor.execute("UPDATE users SET password_hash = %s WHERE id = %s", (hashed_password, user_id))
-                    flash('Password updated successfully!', 'success')
+                from auth import check_password_hash
+                if user and check_password_hash(user['password_hash'], current_password):
+                    if new_password == confirm_password:
+                        from auth import generate_password_hash
+                        hashed_password = generate_password_hash(new_password)
+                        cur.execute("UPDATE users SET password_hash = %s WHERE id = %s", (hashed_password, user_id))
+                        flash('Password updated successfully!', 'success')
+                    else:
+                        flash('New passwords do not match!', 'danger')
+                        return redirect(url_for('settings') + '#account')
                 else:
-                    flash('New passwords do not match!', 'danger')
-                    db.close()
+                    flash('Current password is incorrect!', 'danger')
                     return redirect(url_for('settings') + '#account')
-            else:
-                flash('Current password is incorrect!', 'danger')
-                db.close()
-                return redirect(url_for('settings') + '#account')
-
-        db.commit()
-        cursor.close()
-        db.close()
 
         flash('Account settings updated successfully!', 'success')
         return redirect(url_for('settings') + '#account')
@@ -2893,12 +2432,10 @@ def register_user_routes(app):
         language = request.form.get('language')
         bio = request.form.get('bio')
 
-        db = get_db()
-        cursor = db.cursor(dictionary=True)
-
-        # Get current user data to check existing image
-        cursor.execute("SELECT profile_image FROM users WHERE id = %s", (user_id,))
-        current_user = cursor.fetchone()
+        with get_db_cursor_readonly() as cur:
+            # Get current user data to check existing image
+            cur.execute("SELECT profile_image FROM users WHERE id = %s", (user_id,))
+            current_user = cur.fetchone()
 
         # Handle profile image upload
         profile_image = None
@@ -2943,8 +2480,6 @@ def register_user_routes(app):
                     profile_image = new_filename
                 else:
                     flash('Invalid file type. Please upload JPG, PNG, or GIF.', 'danger')
-                    cursor.close()
-                    db.close()
                     return redirect(url_for('settings') + '#profile')
 
         # Update user profile
@@ -2966,106 +2501,85 @@ def register_user_routes(app):
         update_query += " WHERE id = %s"
         params.append(user_id)
 
-        cursor.execute(update_query, params)
-        db.commit()
-
-        cursor.close()
-        db.close()
+        with get_db_cursor() as cur:
+            cur.execute(update_query, params)
 
         flash('Profile updated successfully!', 'success')
         return redirect(url_for('settings') + '#profile')
 
     def handle_notifications_form(user_id, form_data):
         """Handle notifications form submission"""
-        db = get_db()
-        cursor = db.cursor()
-
-        # Get checkbox values (checkboxes return 'on' when checked, None when not checked)
-        email_notifications = 1 if form_data.get('email_notifications') == 'on' else 0
-        email_updates = 1 if form_data.get('email_updates') == 'on' else 0
-        email_newsletter = 1 if form_data.get('email_newsletter') == 'on' else 0
-        email_promotions = 1 if form_data.get('email_promotions') == 'on' else 0
-        app_notifications = 1 if form_data.get('app_notifications') == 'on' else 0
-        app_security = 1 if form_data.get('app_security') == 'on' else 0
-        app_reminders = 1 if form_data.get('app_reminders') == 'on' else 0
+        # Get checkbox values
+        email_notifications = True if form_data.get('email_notifications') == 'on' else False
+        email_updates = True if form_data.get('email_updates') == 'on' else False
+        email_newsletter = True if form_data.get('email_newsletter') == 'on' else False
+        email_promotions = True if form_data.get('email_promotions') == 'on' else False
+        app_notifications = True if form_data.get('app_notifications') == 'on' else False
+        app_security = True if form_data.get('app_security') == 'on' else False
+        app_reminders = True if form_data.get('app_reminders') == 'on' else False
         frequency = form_data.get('frequency', 'realtime')
 
-        cursor.execute("""
-            UPDATE user_settings 
-            SET email_notifications = %s,
-                email_updates = %s,
-                email_newsletter = %s,
-                email_promotions = %s,
-                app_notifications = %s,
-                app_security = %s,
-                app_reminders = %s,
-                frequency = %s
-            WHERE user_id = %s
-        """, (email_notifications, email_updates, email_newsletter, email_promotions,
-              app_notifications, app_security, app_reminders, frequency, user_id))
-
-        db.commit()
-        cursor.close()
-        db.close()
+        with get_db_cursor() as cur:
+            cur.execute("""
+                UPDATE user_settings 
+                SET email_notifications = %s,
+                    email_updates = %s,
+                    email_newsletter = %s,
+                    email_promotions = %s,
+                    app_notifications = %s,
+                    app_security = %s,
+                    app_reminders = %s,
+                    frequency = %s
+                WHERE user_id = %s
+            """, (email_notifications, email_updates, email_newsletter, email_promotions,
+                  app_notifications, app_security, app_reminders, frequency, user_id))
 
         flash('Notification settings updated!', 'success')
         return redirect(url_for('settings') + '#notifications')
 
     def handle_privacy_form(user_id, form_data):
         """Handle privacy form submission"""
-        db = get_db()
-        cursor = db.cursor()
+        profile_public = True if form_data.get('profile_public') == 'on' else False
+        show_diagnosis = True if form_data.get('show_diagnosis') == 'on' else False
+        data_collection = True if form_data.get('data_collection') == 'on' else False
 
-        profile_public = 1 if form_data.get('profile_public') == 'on' else 0
-        show_diagnosis = 1 if form_data.get('show_diagnosis') == 'on' else 0
-        data_collection = 1 if form_data.get('data_collection') == 'on' else 0
-
-        cursor.execute("""
-            UPDATE user_settings 
-            SET profile_public = %s,
-                show_diagnosis = %s,
-                data_collection = %s
-            WHERE user_id = %s
-        """, (profile_public, show_diagnosis, data_collection, user_id))
-
-        db.commit()
-        cursor.close()
-        db.close()
+        with get_db_cursor() as cur:
+            cur.execute("""
+                UPDATE user_settings 
+                SET profile_public = %s,
+                    show_diagnosis = %s,
+                    data_collection = %s
+                WHERE user_id = %s
+            """, (profile_public, show_diagnosis, data_collection, user_id))
 
         flash('Privacy settings updated!', 'success')
         return redirect(url_for('settings') + '#privacy')
 
     def handle_preferences_form(user_id, form_data):
         """Handle preferences form submission"""
-        db = get_db()
-        cursor = db.cursor()
-
         theme = form_data.get('theme', 'light')
         density = form_data.get('density', 'comfortable')
-        auto_save = 1 if form_data.get('auto_save') == 'on' else 0
-        show_tips = 1 if form_data.get('show_tips') == 'on' else 0
-        detailed_results = 1 if form_data.get('detailed_results') == 'on' else 0
-        quick_analysis = 1 if form_data.get('quick_analysis') == 'on' else 0
+        auto_save = True if form_data.get('auto_save') == 'on' else False
+        show_tips = True if form_data.get('show_tips') == 'on' else False
+        detailed_results = True if form_data.get('detailed_results') == 'on' else False
+        quick_analysis = True if form_data.get('quick_analysis') == 'on' else False
         default_crop = form_data.get('default_crop', '')
         measurement_unit = form_data.get('measurement_unit', 'metric')
 
-        cursor.execute("""
-            UPDATE user_settings 
-            SET theme = %s,
-                density = %s,
-                auto_save = %s,
-                show_tips = %s,
-                detailed_results = %s,
-                quick_analysis = %s,
-                default_crop = %s,
-                measurement_unit = %s
-            WHERE user_id = %s
-        """, (theme, density, auto_save, show_tips, detailed_results,
-              quick_analysis, default_crop, measurement_unit, user_id))
-
-        db.commit()
-        cursor.close()
-        db.close()
+        with get_db_cursor() as cur:
+            cur.execute("""
+                UPDATE user_settings 
+                SET theme = %s,
+                    density = %s,
+                    auto_save = %s,
+                    show_tips = %s,
+                    detailed_results = %s,
+                    quick_analysis = %s,
+                    default_crop = %s,
+                    measurement_unit = %s
+                WHERE user_id = %s
+            """, (theme, density, auto_save, show_tips, detailed_results,
+                  quick_analysis, default_crop, measurement_unit, user_id))
 
         flash('Preferences updated!', 'success')
         return redirect(url_for('settings') + '#preferences')
@@ -3095,94 +2609,89 @@ def register_user_routes(app):
     @admin_required
     def admin_analytics():
         """Admin analytics page"""
-        db = None
-        cur = None
-
         try:
-            db = get_db()
-            cur = db.cursor(dictionary=True)
-
             # Get period filter with safe default
             period = request.args.get('period', '30')
             days = int(period) if period and period.isdigit() else 30
             start_date = datetime.now() - timedelta(days=days)
 
-            # ===== USER DISTRIBUTION =====
-            cur.execute("""
-                SELECT 
-                    user_type,
-                    COUNT(*) as count
-                FROM users
-                GROUP BY user_type
-                ORDER BY count DESC
-            """)
-            user_distribution = cur.fetchall()
+            with get_db_cursor_readonly() as cur:
+                # ===== USER DISTRIBUTION =====
+                cur.execute("""
+                    SELECT 
+                        user_type,
+                        COUNT(*) as count
+                    FROM users
+                    GROUP BY user_type
+                    ORDER BY count DESC
+                """)
+                user_distribution = cur.fetchall()
 
-            # ===== DAILY NEW USERS (NOT cumulative) =====
-            cur.execute("""
-                SELECT 
-                    DATE(created_at) as date,
-                    COUNT(*) as new_users
-                FROM users
-                WHERE created_at >= %s
-                GROUP BY DATE(created_at)
-                ORDER BY date
-            """, (start_date,))
-            user_growth = cur.fetchall()
+                # ===== DAILY NEW USERS =====
+                cur.execute("""
+                    SELECT 
+                        DATE(created_at) as date,
+                        COUNT(*) as new_users
+                    FROM users
+                    WHERE created_at >= %s
+                    GROUP BY DATE(created_at)
+                    ORDER BY date
+                """, (start_date,))
+                user_growth = cur.fetchall()
 
-            # ===== DAILY DIAGNOSES (NOT cumulative) =====
-            cur.execute("""
-                SELECT 
-                    DATE(created_at) as date,
-                    COUNT(*) as diagnoses
-                FROM diagnosis_history
-                WHERE created_at >= %s
-                GROUP BY DATE(created_at)
-                ORDER BY date
-            """, (start_date,))
-            daily_diagnoses = cur.fetchall()
+                # ===== DAILY DIAGNOSES =====
+                cur.execute("""
+                    SELECT 
+                        DATE(created_at) as date,
+                        COUNT(*) as diagnoses
+                    FROM diagnosis_history
+                    WHERE created_at >= %s
+                    GROUP BY DATE(created_at)
+                    ORDER BY date
+                """, (start_date,))
+                daily_diagnoses = cur.fetchall()
 
-            # ===== DIAGNOSES BY CROP =====
-            cur.execute("""
-                SELECT 
-                    crop,
-                    COUNT(*) as count,
-                    ROUND(AVG(confidence), 1) as avg_confidence
-                FROM diagnosis_history
-                WHERE crop IS NOT NULL AND created_at >= %s
-                GROUP BY crop
-                ORDER BY count DESC
-                LIMIT 10
-            """, (start_date,))
-            top_crops = cur.fetchall()
+                # ===== DIAGNOSES BY CROP =====
+                cur.execute("""
+                    SELECT 
+                        crop,
+                        COUNT(*) as count,
+                        ROUND(AVG(confidence), 1) as avg_confidence
+                    FROM diagnosis_history
+                    WHERE crop IS NOT NULL AND created_at >= %s
+                    GROUP BY crop
+                    ORDER BY count DESC
+                    LIMIT 10
+                """, (start_date,))
+                top_crops = cur.fetchall()
 
-            # ===== TOP DISEASES =====
-            cur.execute("""
-                SELECT 
-                    disease_detected,
-                    COUNT(*) as count,
-                    ROUND(AVG(confidence), 1) as avg_confidence
-                FROM diagnosis_history
-                WHERE disease_detected != 'Healthy Plant' 
-                  AND disease_detected IS NOT NULL
-                  AND created_at >= %s
-                GROUP BY disease_detected
-                ORDER BY count DESC
-                LIMIT 10
-            """, (start_date,))
-            top_diseases = cur.fetchall()
+                # ===== TOP DISEASES =====
+                cur.execute("""
+                    SELECT 
+                        disease_detected,
+                        COUNT(*) as count,
+                        ROUND(AVG(confidence), 1) as avg_confidence
+                    FROM diagnosis_history
+                    WHERE disease_detected != 'Healthy Plant' 
+                      AND disease_detected IS NOT NULL
+                      AND created_at >= %s
+                    GROUP BY disease_detected
+                    ORDER BY count DESC
+                    LIMIT 10
+                """, (start_date,))
+                top_diseases = cur.fetchall()
 
-            # Get pending counts for sidebar
-            cur.execute("SELECT COUNT(*) as count FROM users WHERE is_active = 0")
-            pending_users = cur.fetchone()['count'] or 0
+                # Get pending counts for sidebar
+                cur.execute("SELECT COUNT(*) as count FROM users WHERE is_active = FALSE")
+                pending_users = cur.fetchone()['count'] or 0
 
-            cur.execute("SELECT COUNT(*) as count FROM feedback WHERE status = 'pending'")
-            pending_feedback = cur.fetchone()['count'] or 0
+                cur.execute("SELECT COUNT(*) as count FROM feedback WHERE status = 'pending'")
+                pending_feedback = cur.fetchone()['count'] or 0
 
-            stats = {
-                'pending_users': pending_users,
-                'pending_feedback': pending_feedback
-            }
+                stats = {
+                    'pending_users': pending_users,
+                    'pending_feedback': pending_feedback
+                }
 
             # Calculate summary stats
             total_users = sum(item['count'] for item in user_distribution)
@@ -3208,73 +2717,61 @@ def register_user_routes(app):
             traceback.print_exc()
             flash('Error loading analytics', 'danger')
             return redirect(url_for('admin_dashboard'))
-        finally:
-            if cur: cur.close()
-            if db: db.close()
 
     @app.route("/admin/settings")
     @admin_required
     def admin_settings():
         """Admin settings page - separate from farmer settings"""
-        db = None
-        cur = None
-
         try:
-            db = get_db()
-            cur = db.cursor(dictionary=True)
-
-            # Get admin user data from users table
-            cur.execute("""
-                SELECT id, username, email, full_name, user_type, 
-                       phone_number as phone, location, bio, profile_image,
-                       is_active, created_at, last_login
-                FROM users 
-                WHERE id = %s
-            """, (session['user_id'],))
-            admin = cur.fetchone()
-
-            # Get user settings from user_settings table
-            cur.execute("""
-                SELECT * FROM user_settings 
-                WHERE user_id = %s
-            """, (session['user_id'],))
-            user_settings = cur.fetchone()
-
-            # If no settings exist, create default
-            if not user_settings:
+            with get_db_cursor_readonly() as cur:
+                # Get admin user data from users table
                 cur.execute("""
-                    INSERT INTO user_settings (user_id) VALUES (%s)
+                    SELECT id, username, email, full_name, user_type, 
+                           phone_number as phone, location, bio, profile_image,
+                           is_active, created_at, last_login
+                    FROM users 
+                    WHERE id = %s
                 """, (session['user_id'],))
-                db.commit()
+                admin = cur.fetchone()
 
+                # Get user settings from user_settings table
                 cur.execute("""
                     SELECT * FROM user_settings 
                     WHERE user_id = %s
                 """, (session['user_id'],))
                 user_settings = cur.fetchone()
 
-            # Get system statistics for admin
-            cur.execute("SELECT COUNT(*) as total FROM users")
-            total_users = cur.fetchone()['total']
+                # If no settings exist, create default
+                if not user_settings:
+                    with get_db_cursor() as insert_cur:
+                        insert_cur.execute("""
+                            INSERT INTO user_settings (user_id) VALUES (%s)
+                            RETURNING *
+                        """, (session['user_id'],))
+                        user_settings = insert_cur.fetchone()
 
-            cur.execute("SELECT COUNT(*) as total FROM diagnosis_history")
-            total_diagnoses = cur.fetchone()['total']
+                # Get system statistics for admin
+                cur.execute("SELECT COUNT(*) as total FROM users")
+                total_users = cur.fetchone()['total']
 
-            # Get pending feedback count
-            cur.execute("SELECT COUNT(*) as total FROM feedback WHERE status = 'pending'")
-            pending_feedback = cur.fetchone()['total']
+                cur.execute("SELECT COUNT(*) as total FROM diagnosis_history")
+                total_diagnoses = cur.fetchone()['total']
 
-            # Get recent admin actions from users table (last login)
-            recent_activities = [
-                {
-                    'action': 'Logged in to admin panel',
-                    'created_at': admin['last_login'] if admin['last_login'] else datetime.now()
-                },
-                {
-                    'action': 'Viewed admin settings',
-                    'created_at': datetime.now()
-                }
-            ]
+                # Get pending feedback count
+                cur.execute("SELECT COUNT(*) as total FROM feedback WHERE status = 'pending'")
+                pending_feedback = cur.fetchone()['total']
+
+                # Get recent admin actions
+                recent_activities = [
+                    {
+                        'action': 'Logged in to admin panel',
+                        'created_at': admin['last_login'] if admin['last_login'] else datetime.now()
+                    },
+                    {
+                        'action': 'Viewed admin settings',
+                        'created_at': datetime.now()
+                    }
+                ]
 
             return render_template("admin/settings.html",
                                    admin=admin,
@@ -3291,17 +2788,11 @@ def register_user_routes(app):
             traceback.print_exc()
             flash('Error loading admin settings', 'danger')
             return redirect(url_for('admin_dashboard'))
-        finally:
-            if cur: cur.close()
-            if db: db.close()
 
     @app.route("/admin/settings/update", methods=["POST"])
     @admin_required
     def admin_update_settings():
         """Update admin profile settings"""
-        db = None
-        cur = None
-
         try:
             full_name = request.form.get('full_name')
             email = request.form.get('email')
@@ -3310,28 +2801,24 @@ def register_user_routes(app):
             bio = request.form.get('bio')
 
             # Get notification preferences
-            email_notifications = 1 if request.form.get('email_notifications') == 'on' else 0
-            app_notifications = 1 if request.form.get('app_notifications') == 'on' else 0
+            email_notifications = True if request.form.get('email_notifications') == 'on' else False
+            app_notifications = True if request.form.get('app_notifications') == 'on' else False
 
-            db = get_db()
-            cur = db.cursor()
+            with get_db_cursor() as cur:
+                # Update users table
+                cur.execute("""
+                    UPDATE users 
+                    SET full_name = %s, email = %s, phone_number = %s, 
+                        location = %s, bio = %s, updated_at = NOW()
+                    WHERE id = %s
+                """, (full_name, email, phone, location, bio, session['user_id']))
 
-            # Update users table
-            cur.execute("""
-                UPDATE users 
-                SET full_name = %s, email = %s, phone_number = %s, 
-                    location = %s, bio = %s, updated_at = NOW()
-                WHERE id = %s
-            """, (full_name, email, phone, location, bio, session['user_id']))
-
-            # Update user_settings table
-            cur.execute("""
-                UPDATE user_settings 
-                SET email_notifications = %s, app_notifications = %s
-                WHERE user_id = %s
-            """, (email_notifications, app_notifications, session['user_id']))
-
-            db.commit()
+                # Update user_settings table
+                cur.execute("""
+                    UPDATE user_settings 
+                    SET email_notifications = %s, app_notifications = %s
+                    WHERE user_id = %s
+                """, (email_notifications, app_notifications, session['user_id']))
 
             # Update session
             session['full_name'] = full_name
@@ -3341,12 +2828,7 @@ def register_user_routes(app):
 
         except Exception as e:
             print(f"Admin update settings error: {e}")
-            if db:
-                db.rollback()
             flash('Error updating profile', 'danger')
-        finally:
-            if cur: cur.close()
-            if db: db.close()
 
         return redirect(url_for('admin_settings'))
 
@@ -3354,13 +2836,7 @@ def register_user_routes(app):
     @admin_required
     def admin_history():
         """Admin view of all diagnosis history with expert reviews"""
-        db = None
-        cur = None
-
         try:
-            db = get_db()
-            cur = db.cursor(dictionary=True)
-
             # Get filter parameters
             expert_review_status = request.args.get('expert_review_status', '')
             image_processed = request.args.get('image_processed', '')
@@ -3372,163 +2848,137 @@ def register_user_routes(app):
             per_page = 20
             offset = (page - 1) * per_page
 
-            # Base query with farmer info and expert review details
-            query = """
-                SELECT 
-                    dh.*,
-                    u.username as farmer_name,
-                    u2.username as reviewed_by_name
-                FROM diagnosis_history dh
-                JOIN users u ON dh.user_id = u.id
-                LEFT JOIN users u2 ON dh.reviewed_by = u2.id
-                WHERE 1=1
-            """
-            count_query = "SELECT COUNT(*) as total FROM diagnosis_history dh WHERE 1=1"
-            params = []
-            count_params = []
+            with get_db_cursor_readonly() as cur:
+                # Base query with farmer info and expert review details
+                query = """
+                    SELECT 
+                        dh.*,
+                        u.username as farmer_name,
+                        u2.username as reviewed_by_name
+                    FROM diagnosis_history dh
+                    JOIN users u ON dh.user_id = u.id
+                    LEFT JOIN users u2 ON dh.reviewed_by = u2.id
+                    WHERE 1=1
+                """
+                count_query = "SELECT COUNT(*) as total FROM diagnosis_history dh WHERE 1=1"
+                params = []
+                count_params = []
 
-            # Apply filters
-            if expert_review_status:
-                query += " AND dh.expert_review_status = %s"
-                count_query += " AND dh.expert_review_status = %s"
-                params.append(expert_review_status)
-                count_params.append(expert_review_status)
+                # Apply filters
+                if expert_review_status:
+                    query += " AND dh.expert_review_status = %s"
+                    count_query += " AND dh.expert_review_status = %s"
+                    params.append(expert_review_status)
+                    count_params.append(expert_review_status)
 
-            if image_processed:
-                query += " AND dh.image_processed = %s"
-                count_query += " AND dh.image_processed = %s"
-                params.append(int(image_processed))
-                count_params.append(int(image_processed))
+                if image_processed:
+                    query += " AND dh.image_processed = %s"
+                    count_query += " AND dh.image_processed = %s"
+                    params.append(image_processed == 'true')
+                    count_params.append(image_processed == 'true')
 
-            if final_confidence_level:
-                query += " AND dh.final_confidence_level = %s"
-                count_query += " AND dh.final_confidence_level = %s"
-                params.append(final_confidence_level)
-                count_params.append(final_confidence_level)
+                if final_confidence_level:
+                    query += " AND dh.final_confidence_level = %s"
+                    count_query += " AND dh.final_confidence_level = %s"
+                    params.append(final_confidence_level)
+                    count_params.append(final_confidence_level)
 
-            if crop:
-                query += " AND dh.crop = %s"
-                count_query += " AND dh.crop = %s"
-                params.append(crop)
-                count_params.append(crop)
+                if crop:
+                    query += " AND dh.crop = %s"
+                    count_query += " AND dh.crop = %s"
+                    params.append(crop)
+                    count_params.append(crop)
 
-            if farmer:
-                query += " AND u.username LIKE %s"
-                count_query += " AND u.username LIKE %s"
-                params.append(f'%{farmer}%')
-                count_params.append(f'%{farmer}%')
+                if farmer:
+                    query += " AND u.username ILIKE %s"
+                    count_query += " AND u.username ILIKE %s"
+                    params.append(f'%{farmer}%')
+                    count_params.append(f'%{farmer}%')
 
-            # Get total count for pagination
-            cur.execute(count_query, count_params)
-            total_row = cur.fetchone()
-            total = total_row['total'] if total_row else 0
-            total_pages = (total + per_page - 1) // per_page if total > 0 else 1
+                # Get total count for pagination
+                cur.execute(count_query, count_params)
+                total_row = cur.fetchone()
+                total = total_row['total'] if total_row else 0
+                total_pages = (total + per_page - 1) // per_page if total > 0 else 1
 
-            # Add pagination
-            query += " ORDER BY dh.created_at DESC LIMIT %s OFFSET %s"
-            params.extend([per_page, offset])
+                # Add pagination
+                query += " ORDER BY dh.created_at DESC LIMIT %s OFFSET %s"
+                params.extend([per_page, offset])
 
-            cur.execute(query, params)
-            diagnoses = cur.fetchall()
+                cur.execute(query, params)
+                diagnoses = cur.fetchall()
 
-            # After diagnoses = cur.fetchall()
-            print("\n=== IMAGE PATH DEBUG ===")
-            for diag in diagnoses[:10]:  # Check first 10
-                if diag.get('image_path'):
-                    print(f"ID: {diag['id']}, Image Path from DB: '{diag['image_path']}'")
+                # Parse JSON fields for each diagnosis
+                for diag in diagnoses:
+                    if diag.get('expert_answers'):
+                        try:
+                            if isinstance(diag['expert_answers'], str):
+                                diag['expert_answers_parsed'] = json.loads(diag['expert_answers'])
+                            else:
+                                diag['expert_answers_parsed'] = diag['expert_answers']
+                        except:
+                            diag['expert_answers_parsed'] = []
 
-                    # Get the absolute path to your app directory
-                    app_dir = os.path.dirname(os.path.abspath(__file__))
+                    if diag.get('expert_summary'):
+                        try:
+                            if isinstance(diag['expert_summary'], str):
+                                diag['expert_summary_parsed'] = json.loads(diag['expert_summary'])
+                            else:
+                                diag['expert_summary_parsed'] = diag['expert_summary']
+                        except:
+                            diag['expert_summary_parsed'] = {'notes': diag['expert_summary']}
 
-                    # Try different possible locations
-                    possible_paths = [
-                        os.path.join(app_dir, 'static', 'uploads', diag['image_path']),
-                        os.path.join(app_dir, 'uploads', diag['image_path']),
-                        os.path.join(app_dir, 'static', diag['image_path']),
-                        os.path.join(app_dir, diag['image_path']),
-                    ]
+                # Get statistics with expert_review_status
+                cur.execute("""
+                    SELECT 
+                        COUNT(*) as total,
+                        SUM(CASE WHEN expert_review_status = 'accurate' THEN 1 ELSE 0 END) as accurate,
+                        SUM(CASE WHEN expert_review_status = 'needs correction' THEN 1 ELSE 0 END) as needs_correction,
+                        SUM(CASE WHEN expert_review_status = 'reject' THEN 1 ELSE 0 END) as rejected,
+                        SUM(CASE WHEN expert_review_status IS NULL OR expert_review_status = 'pending' THEN 1 ELSE 0 END) as pending,
+                        ROUND(AVG(confidence), 1) as avg_confidence
+                    FROM diagnosis_history
+                """)
+                stats_row = cur.fetchone()
+                stats = stats_row if stats_row else {
+                    'total': 0,
+                    'accurate': 0,
+                    'needs_correction': 0,
+                    'rejected': 0,
+                    'pending': 0,
+                    'avg_confidence': 0
+                }
 
-                    for path in possible_paths:
-                        exists = os.path.exists(path)
-                        print(f"  Checking: {path}")
-                        print(f"  Exists: {exists}")
-                        if exists:
-                            print(f"  ✅ FOUND at: {path}")
-                            break
-            print("========================\n")
+                # Get unique crops for filter
+                cur.execute("SELECT DISTINCT crop FROM diagnosis_history WHERE crop IS NOT NULL ORDER BY crop")
+                crop_rows = cur.fetchall()
+                crops = [row['crop'] for row in crop_rows] if crop_rows else []
 
-            # Parse JSON fields for each diagnosis
-            for diag in diagnoses:
-                if diag.get('expert_answers'):
-                    try:
-                        if isinstance(diag['expert_answers'], str):
-                            diag['expert_answers_parsed'] = json.loads(diag['expert_answers'])
-                        else:
-                            diag['expert_answers_parsed'] = diag['expert_answers']
-                    except:
-                        diag['expert_answers_parsed'] = []
+                # Get sidebar stats
+                cur.execute("SELECT COUNT(*) as count FROM users WHERE is_active = FALSE")
+                pending_users = cur.fetchone()['count'] or 0
 
-                if diag.get('expert_summary'):
-                    try:
-                        if isinstance(diag['expert_summary'], str):
-                            diag['expert_summary_parsed'] = json.loads(diag['expert_summary'])
-                        else:
-                            diag['expert_summary_parsed'] = diag['expert_summary']
-                    except:
-                        diag['expert_summary_parsed'] = {'notes': diag['expert_summary']}
+                cur.execute("SELECT COUNT(*) as count FROM feedback WHERE status = 'pending'")
+                pending_feedback = cur.fetchone()['count'] or 0
 
-            # Get statistics with expert_review_status
-            cur.execute("""
-                SELECT 
-                    COUNT(*) as total,
-                    SUM(CASE WHEN expert_review_status = 'accurate' THEN 1 ELSE 0 END) as accurate,
-                    SUM(CASE WHEN expert_review_status = 'needs correction' THEN 1 ELSE 0 END) as needs_correction,
-                    SUM(CASE WHEN expert_review_status = 'reject' THEN 1 ELSE 0 END) as rejected,
-                    SUM(CASE WHEN expert_review_status IS NULL OR expert_review_status = 'pending' THEN 1 ELSE 0 END) as pending,
-                    ROUND(AVG(confidence), 1) as avg_confidence
-                FROM diagnosis_history
-            """)
-            stats_row = cur.fetchone()
-            stats = stats_row if stats_row else {
-                'total': 0,
-                'accurate': 0,
-                'needs_correction': 0,
-                'rejected': 0,
-                'pending': 0,
-                'avg_confidence': 0
-            }
+                cur.execute("SELECT COUNT(*) as count FROM diagnosis_history WHERE expert_review_status = 'pending'")
+                pending_reviews = cur.fetchone()['count'] or 0
 
-            # Get unique crops for filter
-            cur.execute("SELECT DISTINCT crop FROM diagnosis_history WHERE crop IS NOT NULL ORDER BY crop")
-            crop_rows = cur.fetchall()
-            crops = [row['crop'] for row in crop_rows] if crop_rows else []
+                sidebar_stats = {
+                    'pending_users': pending_users,
+                    'pending_feedback': pending_feedback,
+                    'pending_diseases': 0,
+                    'pending_reviews': pending_reviews
+                }
 
-            # Get sidebar stats - UPDATED to use expert_review_status
-            cur.execute("SELECT COUNT(*) as count FROM users WHERE is_active = 0")
-            pending_users = cur.fetchone()['count'] or 0
-
-            cur.execute("SELECT COUNT(*) as count FROM feedback WHERE status = 'pending'")
-            pending_feedback = cur.fetchone()['count'] or 0
-
-            # THIS IS THE KEY CHANGE - Use expert_review_status instead of review_status
-            cur.execute("SELECT COUNT(*) as count FROM diagnosis_history WHERE expert_review_status = 'pending'")
-            pending_reviews = cur.fetchone()['count'] or 0
-
-            sidebar_stats = {
-                'pending_users': pending_users,
-                'pending_feedback': pending_feedback,
-                'pending_diseases': 0,
-                'pending_reviews': pending_reviews
-            }
-
-            # Build filters dict for template
-            filters = {
-                'expert_review_status': expert_review_status,
-                'image_processed': image_processed,
-                'final_confidence_level': final_confidence_level,
-                'crop': crop,
-                'farmer': farmer
-            }
+                # Build filters dict for template
+                filters = {
+                    'expert_review_status': expert_review_status,
+                    'image_processed': image_processed,
+                    'final_confidence_level': final_confidence_level,
+                    'crop': crop,
+                    'farmer': farmer
+                }
 
             return render_template("admin/admin_history.html",
                                    diagnoses=diagnoses,
@@ -3546,57 +2996,40 @@ def register_user_routes(app):
             traceback.print_exc()
             flash('Error loading diagnosis history', 'danger')
             return redirect(url_for('admin_dashboard'))
-        finally:
-            if cur:
-                try:
-                    cur.close()
-                except:
-                    pass
-            if db:
-                try:
-                    db.close()
-                except:
-                    pass
 
     # ========== EXPERT DASHBOARD ==========
     @app.route("/expert/dashboard")
     @expert_required
     def expert_dashboard():
         """Expert dashboard - simplified version"""
-        db = None
-        cur = None
-
         try:
-            db = get_db()
-            cur = db.cursor(dictionary=True)
-
             expert_id = session['user_id']
 
-            # Get expert basic info from users table (only existing columns)
-            cur.execute("""
-                SELECT username, full_name, email, profile_image, created_at
-                FROM users WHERE id = %s
-            """, (expert_id,))
-            expert = cur.fetchone()
+            with get_db_cursor_readonly() as cur:
+                # Get expert basic info from users table (only existing columns)
+                cur.execute("""
+                    SELECT username, full_name, email, profile_image, created_at
+                    FROM users WHERE id = %s
+                """, (expert_id,))
+                expert = cur.fetchone()
 
-            # Get statistics from diagnosis_history
-            # Total diagnoses in system that need review
-            cur.execute("SELECT COUNT(*) as count FROM diagnosis_history")
-            total_diagnoses = cur.fetchone()['count'] or 0
+                # Get statistics from diagnosis_history
+                cur.execute("SELECT COUNT(*) as count FROM diagnosis_history")
+                total_diagnoses = cur.fetchone()['count'] or 0
 
-            # Get recent diagnoses that need expert attention
-            cur.execute("""
-                SELECT dh.*, u.username as farmer_name
-                FROM diagnosis_history dh
-                JOIN users u ON dh.user_id = u.id
-                ORDER BY dh.created_at DESC
-                LIMIT 10
-            """)
-            recent_diagnoses = cur.fetchall()
+                # Get recent diagnoses that need expert attention
+                cur.execute("""
+                    SELECT dh.*, u.username as farmer_name
+                    FROM diagnosis_history dh
+                    JOIN users u ON dh.user_id = u.id
+                    ORDER BY dh.created_at DESC
+                    LIMIT 10
+                """)
+                recent_diagnoses = cur.fetchall()
 
-            # Get disease library count
-            cur.execute("SELECT COUNT(*) as count FROM disease_info")
-            disease_count = cur.fetchone()['count'] or 0
+                # Get disease library count
+                cur.execute("SELECT COUNT(*) as count FROM disease_info")
+                disease_count = cur.fetchone()['count'] or 0
 
             return render_template("expert/dashboard.html",
                                    expert=expert,
@@ -3611,35 +3044,26 @@ def register_user_routes(app):
             traceback.print_exc()
             flash('Error loading dashboard', 'danger')
             return redirect(url_for('dashboard'))
-        finally:
-            if cur: cur.close()
-            if db: db.close()
 
     # ========== EXPERT DISEASE MANAGEMENT ==========
     @app.route("/expert/diseases")
     @expert_required
     def expert_diseases():
         """Expert - Manage disease library"""
-        db = None
-        cur = None
-
         try:
-            db = get_db()
-            cur = db.cursor(dictionary=True)
+            with get_db_cursor_readonly() as cur:
+                cur.execute("""
+                    SELECT id, crop, disease_code, disease_name, cause, 
+                           symptoms, organic_treatment, chemical_treatment, 
+                           prevention, manual_treatment, created_at
+                    FROM disease_info 
+                    ORDER BY crop, disease_name
+                """)
+                diseases = cur.fetchall()
 
-            # Fix: Use correct column names from your disease_info table
-            cur.execute("""
-                SELECT id, crop, disease_code, disease_name, cause, 
-                       symptoms, organic_treatment, chemical_treatment, 
-                       prevention, manual_treatment, created_at
-                FROM disease_info 
-                ORDER BY crop, disease_name
-            """)
-            diseases = cur.fetchall()
-
-            # Get unique crops for filter
-            cur.execute("SELECT DISTINCT crop FROM disease_info ORDER BY crop")
-            crops = [row['crop'] for row in cur.fetchall()]
+                # Get unique crops for filter
+                cur.execute("SELECT DISTINCT crop FROM disease_info ORDER BY crop")
+                crops = [row['crop'] for row in cur.fetchall()]
 
             return render_template("expert/diseases.html",
                                    diseases=diseases,
@@ -3649,17 +3073,11 @@ def register_user_routes(app):
             print(f"Expert diseases error: {e}")
             flash('Error loading diseases', 'danger')
             return redirect(url_for('expert_dashboard'))
-        finally:
-            if cur: cur.close()
-            if db: db.close()
 
     @app.route("/expert/diseases/add", methods=["POST"])
     @expert_required
     def expert_add_disease():
         """Expert - Add new disease"""
-        db = None
-        cur = None
-
         try:
             # Get form data matching your table columns
             crop = request.form.get('crop')
@@ -3672,28 +3090,21 @@ def register_user_routes(app):
             prevention = request.form.get('prevention')
             manual_treatment = request.form.get('manual_treatment')
 
-            db = get_db()
-            cur = db.cursor()
-
-            cur.execute("""
-                INSERT INTO disease_info (
-                    crop, disease_code, disease_name, cause, symptoms,
-                    organic_treatment, chemical_treatment, prevention, 
-                    manual_treatment, created_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-            """, (crop, disease_code, disease_name, cause, symptoms,
-                  organic_treatment, chemical_treatment, prevention, manual_treatment))
-
-            db.commit()
+            with get_db_cursor() as cur:
+                cur.execute("""
+                    INSERT INTO disease_info (
+                        crop, disease_code, disease_name, cause, symptoms,
+                        organic_treatment, chemical_treatment, prevention, 
+                        manual_treatment, created_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                """, (crop, disease_code, disease_name, cause, symptoms,
+                      organic_treatment, chemical_treatment, prevention, manual_treatment))
 
             flash('Disease added successfully!', 'success')
 
         except Exception as e:
             print(f"Add disease error: {e}")
             flash('Error adding disease', 'danger')
-        finally:
-            if cur: cur.close()
-            if db: db.close()
 
         return redirect(url_for('expert_diseases'))
 
@@ -3701,9 +3112,6 @@ def register_user_routes(app):
     @expert_required
     def expert_edit_disease(disease_id):
         """Expert - Edit disease"""
-        db = None
-        cur = None
-
         try:
             # Get form data
             crop = request.form.get('crop')
@@ -3716,30 +3124,23 @@ def register_user_routes(app):
             prevention = request.form.get('prevention')
             manual_treatment = request.form.get('manual_treatment')
 
-            db = get_db()
-            cur = db.cursor()
-
-            cur.execute("""
-                UPDATE disease_info 
-                SET crop = %s, disease_code = %s, disease_name = %s,
-                    cause = %s, symptoms = %s, organic_treatment = %s,
-                    chemical_treatment = %s, prevention = %s,
-                    manual_treatment = %s, created_at = NOW()
-                WHERE id = %s
-            """, (crop, disease_code, disease_name, cause, symptoms,
-                  organic_treatment, chemical_treatment, prevention,
-                  manual_treatment, disease_id))
-
-            db.commit()
+            with get_db_cursor() as cur:
+                cur.execute("""
+                    UPDATE disease_info 
+                    SET crop = %s, disease_code = %s, disease_name = %s,
+                        cause = %s, symptoms = %s, organic_treatment = %s,
+                        chemical_treatment = %s, prevention = %s,
+                        manual_treatment = %s, created_at = NOW()
+                    WHERE id = %s
+                """, (crop, disease_code, disease_name, cause, symptoms,
+                      organic_treatment, chemical_treatment, prevention,
+                      manual_treatment, disease_id))
 
             flash('Disease updated successfully!', 'success')
 
         except Exception as e:
             print(f"Edit disease error: {e}")
             flash('Error updating disease', 'danger')
-        finally:
-            if cur: cur.close()
-            if db: db.close()
 
         return redirect(url_for('expert_diseases'))
 
@@ -3748,24 +3149,15 @@ def register_user_routes(app):
     @expert_required
     def expert_delete_disease(disease_id):
         """Expert - Delete disease"""
-        db = None
-        cur = None
-
         try:
-            db = get_db()
-            cur = db.cursor()
-
-            cur.execute("DELETE FROM disease_info WHERE id = %s", (disease_id,))
-            db.commit()
+            with get_db_cursor() as cur:
+                cur.execute("DELETE FROM disease_info WHERE id = %s", (disease_id,))
 
             flash('Disease deleted successfully!', 'success')
 
         except Exception as e:
             print(f"Delete disease error: {e}")
             flash('Error deleting disease', 'danger')
-        finally:
-            if cur: cur.close()
-            if db: db.close()
 
         return redirect(url_for('expert_diseases'))
 
@@ -3774,40 +3166,34 @@ def register_user_routes(app):
     @expert_required
     def expert_pending_reviews():
         """Expert - View pending diagnoses from diagnosis_history"""
-        db = None
-        cur = None
-
         try:
-            db = get_db()
-            cur = db.cursor(dictionary=True)
-
             page = int(request.args.get('page', 1))
             per_page = 10
             offset = (page - 1) * per_page
 
-            # FIXED: Use expert_review_status = 'pending' instead of training_used = 0
-            cur.execute("""
-                SELECT dh.*, u.username as farmer_name, u.full_name as farmer_full_name
-                FROM diagnosis_history dh
-                JOIN users u ON dh.user_id = u.id
-                WHERE dh.expert_review_status = 'pending' OR dh.expert_review_status IS NULL
-                ORDER BY dh.created_at DESC
-                LIMIT %s OFFSET %s
-            """, (per_page, offset))
-            diagnoses = cur.fetchall()
+            with get_db_cursor_readonly() as cur:
+                cur.execute("""
+                    SELECT dh.*, u.username as farmer_name, u.full_name as farmer_full_name
+                    FROM diagnosis_history dh
+                    JOIN users u ON dh.user_id = u.id
+                    WHERE dh.expert_review_status = 'pending' OR dh.expert_review_status IS NULL
+                    ORDER BY dh.created_at DESC
+                    LIMIT %s OFFSET %s
+                """, (per_page, offset))
+                diagnoses = cur.fetchall()
 
-            # Get total pending count
-            cur.execute("""
-                SELECT COUNT(*) as total 
-                FROM diagnosis_history 
-                WHERE expert_review_status = 'pending' OR expert_review_status IS NULL
-            """)
-            total = cur.fetchone()['total'] or 0
-            total_pages = (total + per_page - 1) // per_page
+                # Get total pending count
+                cur.execute("""
+                    SELECT COUNT(*) as total 
+                    FROM diagnosis_history 
+                    WHERE expert_review_status = 'pending' OR expert_review_status IS NULL
+                """)
+                total = cur.fetchone()['total'] or 0
+                total_pages = (total + per_page - 1) // per_page if total > 0 else 1
 
-            # Get all diseases for reference
-            cur.execute("SELECT id, disease_name, crop FROM disease_info ORDER BY crop, disease_name")
-            diseases = cur.fetchall()
+                # Get all diseases for reference
+                cur.execute("SELECT id, disease_name, crop FROM disease_info ORDER BY crop, disease_name")
+                diseases = cur.fetchall()
 
             return render_template("expert/pending_reviews.html",
                                    diagnoses=diagnoses,
@@ -3815,7 +3201,7 @@ def register_user_routes(app):
                                    total_pages=total_pages,
                                    total=total,
                                    diseases=diseases,
-                                   pending_count=total)  # Use total instead of get_pending_count()
+                                   pending_count=total)
 
         except Exception as e:
             print(f"Pending reviews error: {e}")
@@ -3823,17 +3209,11 @@ def register_user_routes(app):
             traceback.print_exc()
             flash('Error loading pending reviews', 'danger')
             return redirect(url_for('expert_dashboard'))
-        finally:
-            if cur: cur.close()
-            if db: db.close()
 
     @app.route("/expert/review/<int:diagnosis_id>", methods=["POST"])
     @expert_required
     def expert_review_detection(diagnosis_id):
         """Expert - Review a disease detection"""
-        db = None
-        cur = None
-
         try:
             data = request.get_json()
             if not data:
@@ -3845,94 +3225,77 @@ def register_user_routes(app):
             expert_notes = data.get('expert_notes', '')
             corrected_disease = data.get('corrected_disease_id')
 
-            # Convert notes to JSON format (even if empty)
+            # Convert notes to JSON format
             import json
             if not expert_notes or expert_notes.strip() == '':
                 expert_notes_json = json.dumps({"notes": "No notes provided"})
             else:
                 expert_notes_json = json.dumps({"notes": expert_notes})
 
-            db = get_db()
-            cur = db.cursor()
+            with get_db_cursor_readonly() as cur:
+                # First, check if the diagnosis exists
+                cur.execute("SELECT id FROM diagnosis_history WHERE id = %s", (diagnosis_id,))
+                if not cur.fetchone():
+                    return jsonify({'success': False, 'error': 'Diagnosis not found'}), 404
 
-            # First, check if the diagnosis exists
-            cur.execute("SELECT id FROM diagnosis_history WHERE id = %s", (diagnosis_id,))
-            if not cur.fetchone():
-                return jsonify({'success': False, 'error': 'Diagnosis not found'}), 404
+            with get_db_cursor() as cur:
+                if action == 'accurate':
+                    cur.execute("""
+                        UPDATE diagnosis_history 
+                        SET training_used = TRUE,
+                            expert_summary = %s,
+                            for_training = TRUE,
+                            expert_review_status = 'accurate'
+                        WHERE id = %s
+                    """, (expert_notes_json, diagnosis_id))
 
-            if action == 'accurate':
-                cur.execute("""
-                    UPDATE diagnosis_history 
-                    SET training_used = 1,
-                        expert_summary = %s,
-                        for_training = 1,
-                        expert_review_status = 'accurate'
-                    WHERE id = %s
-                """, (expert_notes_json, diagnosis_id))
+                elif action == 'needs correction':
+                    # Get the correct disease name
+                    cur.execute("SELECT disease_name FROM disease_info WHERE id = %s", (corrected_disease,))
+                    disease_result = cur.fetchone()
 
-            elif action == 'needs correction':
-                # Get the correct disease name
-                cur.execute("SELECT disease_name FROM disease_info WHERE id = %s", (corrected_disease,))
-                disease_result = cur.fetchone()
+                    if not disease_result:
+                        return jsonify({'success': False, 'error': 'Selected disease not found'}), 404
 
-                if not disease_result:
-                    return jsonify({'success': False, 'error': 'Selected disease not found'}), 404
+                    correct_disease_name = disease_result[0]
 
-                correct_disease_name = disease_result[0]
+                    cur.execute("""
+                        UPDATE diagnosis_history 
+                        SET training_used = TRUE,
+                            expert_summary = %s,
+                            for_training = TRUE,
+                            expert_review_status = 'needs correction',
+                            disease_detected = %s
+                        WHERE id = %s
+                    """, (expert_notes_json, correct_disease_name, diagnosis_id))
 
-                cur.execute("""
-                    UPDATE diagnosis_history 
-                    SET training_used = 1,
-                        expert_summary = %s,
-                        for_training = 1,
-                        expert_review_status = 'needs correction',
-                        disease_detected = %s
-                    WHERE id = %s
-                """, (expert_notes_json, correct_disease_name, diagnosis_id))
+                elif action == 'reject':
+                    cur.execute("""
+                        UPDATE diagnosis_history 
+                        SET training_used = TRUE,
+                            expert_summary = %s,
+                            expert_review_status = 'reject',
+                            for_training = FALSE
+                        WHERE id = %s
+                    """, (expert_notes_json, diagnosis_id))
 
-            elif action == 'reject':
-                cur.execute("""
-                    UPDATE diagnosis_history 
-                    SET training_used = 1,
-                        expert_summary = %s,
-                        expert_review_status = 'reject',
-                        for_training = 0
-                    WHERE id = %s
-                """, (expert_notes_json, diagnosis_id))
+                else:
+                    return jsonify({'success': False, 'error': f'Invalid action: {action}'}), 400
 
-            else:
-                return jsonify({'success': False, 'error': f'Invalid action: {action}'}), 400
-
-            db.commit()
             print(f"Successfully updated diagnosis {diagnosis_id}")
             return jsonify({'success': True})
 
-        except IntegrityError as err:
-            print(f"Integrity Error: {err}")
-            return jsonify({'success': False, 'error': f"Database constraint error: {err.msg}"}), 500
-        except mysql.connector.Error as err:
-            print(f"MySQL Error: {err}")
-            return jsonify({'success': False, 'error': f"Database error: {err.msg}"}), 500
         except Exception as e:
             print(f"Review error: {e}")
             import traceback
             traceback.print_exc()
             return jsonify({'success': False, 'error': str(e)}), 500
-        finally:
-            if cur: cur.close()
-            if db: db.close()
 
     @app.route("/expert/history")
     @expert_required
     def expert_history():
         """Expert - View review history"""
-        db = None
-        cur = None
-
         try:
-            db = get_db()
-            cur = db.cursor(dictionary=True)
-
             expert_id = session['user_id']
             page = int(request.args.get('page', 1))
             per_page = 10
@@ -3945,104 +3308,104 @@ def register_user_routes(app):
             date_from = request.args.get('date_from', '')
             date_to = request.args.get('date_to', '')
 
-            # Base query with JOIN to users
-            query = """
-                SELECT dh.*, u.username as farmer_name, u.full_name as farmer_full_name
-                FROM diagnosis_history dh
-                JOIN users u ON dh.user_id = u.id
-                WHERE dh.training_used = 1
-            """
-            count_query = """
-                SELECT COUNT(*) as total 
-                FROM diagnosis_history dh
-                JOIN users u ON dh.user_id = u.id
-                WHERE dh.training_used = 1
-            """
-            params = []
-            count_params = []
+            with get_db_cursor_readonly() as cur:
+                # Base query
+                query = """
+                    SELECT dh.*, u.username as farmer_name, u.full_name as farmer_full_name
+                    FROM diagnosis_history dh
+                    JOIN users u ON dh.user_id = u.id
+                    WHERE dh.training_used = TRUE
+                """
+                count_query = """
+                    SELECT COUNT(*) as total 
+                    FROM diagnosis_history dh
+                    JOIN users u ON dh.user_id = u.id
+                    WHERE dh.training_used = TRUE
+                """
+                params = []
+                count_params = []
 
-            # APPLY FILTERS - Farmer name search
-            if farmer:
-                query += " AND (u.username LIKE %s OR u.full_name LIKE %s)"
-                count_query += " AND (u.username LIKE %s OR u.full_name LIKE %s)"
-                params.extend([f'%{farmer}%', f'%{farmer}%'])
-                count_params.extend([f'%{farmer}%', f'%{farmer}%'])
+                # APPLY FILTERS - Farmer name search
+                if farmer:
+                    query += " AND (u.username ILIKE %s OR u.full_name ILIKE %s)"
+                    count_query += " AND (u.username ILIKE %s OR u.full_name ILIKE %s)"
+                    params.extend([f'%{farmer}%', f'%{farmer}%'])
+                    count_params.extend([f'%{farmer}%', f'%{farmer}%'])
 
-            # APPLY FILTERS - Disease filter
-            if disease:
-                query += " AND dh.disease_detected LIKE %s"
-                count_query += " AND dh.disease_detected LIKE %s"
-                params.append(f'%{disease}%')
-                count_params.append(f'%{disease}%')
+                # APPLY FILTERS - Disease filter
+                if disease:
+                    query += " AND dh.disease_detected ILIKE %s"
+                    count_query += " AND dh.disease_detected ILIKE %s"
+                    params.append(f'%{disease}%')
+                    count_params.append(f'%{disease}%')
 
-            # APPLY FILTERS - Status filter
-            if status:
-                if status == 'approved':
-                    query += " AND dh.for_training = 1"
-                    count_query += " AND dh.for_training = 1"
-                elif status == 'rejected':
-                    query += " AND dh.for_training = 0"
-                    count_query += " AND dh.for_training = 0"
-                elif status == 'pending':
-                    query += " AND (dh.for_training IS NULL OR dh.for_training = 2)"
-                    count_query += " AND (dh.for_training IS NULL OR dh.for_training = 2)"
+                # APPLY FILTERS - Status filter
+                if status:
+                    if status == 'approved':
+                        query += " AND dh.for_training = TRUE"
+                        count_query += " AND dh.for_training = TRUE"
+                    elif status == 'rejected':
+                        query += " AND dh.for_training = FALSE"
+                        count_query += " AND dh.for_training = FALSE"
+                    elif status == 'pending':
+                        query += " AND (dh.for_training IS NULL OR dh.for_training = FALSE)"
+                        count_query += " AND (dh.for_training IS NULL OR dh.for_training = FALSE)"
 
-            # APPLY FILTERS - Date from
-            if date_from:
-                query += " AND DATE(dh.created_at) >= %s"
-                count_query += " AND DATE(dh.created_at) >= %s"
-                params.append(date_from)
-                count_params.append(date_from)
+                # APPLY FILTERS - Date from
+                if date_from:
+                    query += " AND DATE(dh.created_at) >= %s"
+                    count_query += " AND DATE(dh.created_at) >= %s"
+                    params.append(date_from)
+                    count_params.append(date_from)
 
-            # APPLY FILTERS - Date to
-            if date_to:
-                query += " AND DATE(dh.created_at) <= %s"
-                count_query += " AND DATE(dh.created_at) <= %s"
-                params.append(date_to)
-                count_params.append(date_to)
+                # APPLY FILTERS - Date to
+                if date_to:
+                    query += " AND DATE(dh.created_at) <= %s"
+                    count_query += " AND DATE(dh.created_at) <= %s"
+                    params.append(date_to)
+                    count_params.append(date_to)
 
-            # Add order by and pagination
-            query += " ORDER BY dh.created_at DESC LIMIT %s OFFSET %s"
-            params.extend([per_page, offset])
+                # Add order by and pagination
+                query += " ORDER BY dh.created_at DESC LIMIT %s OFFSET %s"
+                params.extend([per_page, offset])
 
-            # Execute main query with filters
-            cur.execute(query, params)
-            reviews = cur.fetchall()
+                # Execute main query with filters
+                cur.execute(query, params)
+                reviews = cur.fetchall()
 
-            # Get total count for pagination (with same filters)
-            cur.execute(count_query, count_params)
-            total = cur.fetchone()['total'] or 0
-            total_pages = (total + per_page - 1) // per_page
+                # Get total count for pagination
+                cur.execute(count_query, count_params)
+                total = cur.fetchone()['total'] or 0
+                total_pages = (total + per_page - 1) // per_page if total > 0 else 1
 
-            # Get statistics (filtered)
-            stats_query = """
-                SELECT 
-                    COUNT(*) as total_reviews,
-                    SUM(CASE WHEN for_training = 1 THEN 1 ELSE 0 END) as approved_count,
-                    SUM(CASE WHEN for_training = 0 THEN 1 ELSE 0 END) as rejected_count,
-                    SUM(CASE WHEN for_training IS NULL OR for_training = 2 THEN 1 ELSE 0 END) as pending_count
-                FROM diagnosis_history dh
-                JOIN users u ON dh.user_id = u.id
-                WHERE dh.training_used = 1
-            """
-            stats_params = []
+                # Get statistics
+                stats_query = """
+                    SELECT 
+                        COUNT(*) as total_reviews,
+                        SUM(CASE WHEN for_training = TRUE THEN 1 ELSE 0 END) as approved_count,
+                        SUM(CASE WHEN for_training = FALSE THEN 1 ELSE 0 END) as rejected_count,
+                        SUM(CASE WHEN for_training IS NULL OR for_training = FALSE THEN 1 ELSE 0 END) as pending_count
+                    FROM diagnosis_history dh
+                    JOIN users u ON dh.user_id = u.id
+                    WHERE dh.training_used = TRUE
+                """
+                stats_params = []
 
-            # Apply same filters to stats for consistency
-            if farmer:
-                stats_query += " AND (u.username LIKE %s OR u.full_name LIKE %s)"
-                stats_params.extend([f'%{farmer}%', f'%{farmer}%'])
-            if disease:
-                stats_query += " AND dh.disease_detected LIKE %s"
-                stats_params.append(f'%{disease}%')
-            if date_from:
-                stats_query += " AND DATE(dh.created_at) >= %s"
-                stats_params.append(date_from)
-            if date_to:
-                stats_query += " AND DATE(dh.created_at) <= %s"
-                stats_params.append(date_to)
+                if farmer:
+                    stats_query += " AND (u.username ILIKE %s OR u.full_name ILIKE %s)"
+                    stats_params.extend([f'%{farmer}%', f'%{farmer}%'])
+                if disease:
+                    stats_query += " AND dh.disease_detected ILIKE %s"
+                    stats_params.append(f'%{disease}%')
+                if date_from:
+                    stats_query += " AND DATE(dh.created_at) >= %s"
+                    stats_params.append(date_from)
+                if date_to:
+                    stats_query += " AND DATE(dh.created_at) <= %s"
+                    stats_params.append(date_to)
 
-            cur.execute(stats_query, stats_params)
-            stats = cur.fetchone()
+                cur.execute(stats_query, stats_params)
+                stats = cur.fetchone()
 
             return render_template("expert/history.html",
                                    reviews=reviews,
@@ -4051,7 +3414,7 @@ def register_user_routes(app):
                                    total_results=total,
                                    stats=stats,
                                    pending_count=get_pending_count(),
-                                   request=request)  # Pass request to template for maintaining filter values
+                                   request=request)
 
         except Exception as e:
             print(f"Expert history error: {e}")
@@ -4059,9 +3422,6 @@ def register_user_routes(app):
             traceback.print_exc()
             flash('Error loading history', 'danger')
             return redirect(url_for('expert_dashboard'))
-        finally:
-            if cur: cur.close()
-            if db: db.close()
 
     # ========== EXPERT SETTINGS ROUTES ==========
 
@@ -4069,28 +3429,23 @@ def register_user_routes(app):
     @expert_required
     def expert_settings():
         """Expert settings page"""
-        db = None
-        cur = None
-
         try:
-            db = get_db()
-            cur = db.cursor(dictionary=True)
-
             expert_id = session['user_id']
 
-            # Get expert data
-            cur.execute("""
-                SELECT id, username, email, full_name, user_type, 
-                       phone_number as phone, location, bio, profile_image,
-                       is_active, created_at, last_login
-                FROM users 
-                WHERE id = %s
-            """, (expert_id,))
-            expert = cur.fetchone()
+            with get_db_cursor_readonly() as cur:
+                # Get expert data
+                cur.execute("""
+                    SELECT id, username, email, full_name, user_type, 
+                           phone_number as phone, location, bio, profile_image,
+                           is_active, created_at, last_login
+                    FROM users 
+                    WHERE id = %s
+                """, (expert_id,))
+                expert = cur.fetchone()
 
-            # Get pending count for sidebar
-            cur.execute("SELECT COUNT(*) as count FROM diagnosis_history")
-            pending_count = cur.fetchone()['count'] or 0
+                # Get pending count for sidebar
+                cur.execute("SELECT COUNT(*) as count FROM diagnosis_history WHERE expert_review_status = 'pending'")
+                pending_count = cur.fetchone()['count'] or 0
 
             return render_template("expert/settings.html",
                                    user=expert,
@@ -4101,17 +3456,11 @@ def register_user_routes(app):
             print(f"Expert settings error: {e}")
             flash('Error loading settings', 'danger')
             return redirect(url_for('expert_dashboard'))
-        finally:
-            if cur: cur.close()
-            if db: db.close()
 
     @app.route("/expert/settings/update", methods=["POST"])
     @expert_required
     def expert_update_profile():
         """Update expert profile"""
-        db = None
-        cur = None
-
         try:
             full_name = request.form.get('full_name')
             email = request.form.get('email')
@@ -4119,17 +3468,13 @@ def register_user_routes(app):
             location = request.form.get('location')
             bio = request.form.get('bio')
 
-            db = get_db()
-            cur = db.cursor()
-
-            cur.execute("""
-                UPDATE users 
-                SET full_name = %s, email = %s, phone_number = %s, 
-                    location = %s, bio = %s, updated_at = NOW()
-                WHERE id = %s
-            """, (full_name, email, phone, location, bio, session['user_id']))
-
-            db.commit()
+            with get_db_cursor() as cur:
+                cur.execute("""
+                    UPDATE users 
+                    SET full_name = %s, email = %s, phone_number = %s, 
+                        location = %s, bio = %s, updated_at = NOW()
+                    WHERE id = %s
+                """, (full_name, email, phone, location, bio, session['user_id']))
 
             # Update session
             session['full_name'] = full_name
@@ -4140,9 +3485,6 @@ def register_user_routes(app):
         except Exception as e:
             print(f"Update profile error: {e}")
             flash('Error updating profile', 'danger')
-        finally:
-            if cur: cur.close()
-            if db: db.close()
 
         return redirect(url_for('expert_settings'))
 
@@ -4150,9 +3492,6 @@ def register_user_routes(app):
     @expert_required
     def expert_change_password():
         """Change expert password"""
-        db = None
-        cur = None
-
         try:
             current_password = request.form.get('current_password')
             new_password = request.form.get('new_password')
@@ -4167,12 +3506,10 @@ def register_user_routes(app):
                 flash('Password must be at least 8 characters long!', 'danger')
                 return redirect(url_for('expert_settings'))
 
-            db = get_db()
-            cur = db.cursor(dictionary=True)
-
-            # Get current password hash
-            cur.execute("SELECT password_hash FROM users WHERE id = %s", (session['user_id'],))
-            user = cur.fetchone()
+            with get_db_cursor_readonly() as cur:
+                # Get current password hash
+                cur.execute("SELECT password_hash FROM users WHERE id = %s", (session['user_id'],))
+                user = cur.fetchone()
 
             if not user or not check_password(current_password, user['password_hash']):
                 flash('Current password is incorrect!', 'danger')
@@ -4180,19 +3517,15 @@ def register_user_routes(app):
 
             # Update password
             new_hash = hash_password(new_password)
-            cur.execute("UPDATE users SET password_hash = %s WHERE id = %s",
-                        (new_hash, session['user_id']))
-
-            db.commit()
+            with get_db_cursor() as cur:
+                cur.execute("UPDATE users SET password_hash = %s WHERE id = %s",
+                            (new_hash, session['user_id']))
 
             flash('Password changed successfully!', 'success')
 
         except Exception as e:
             print(f"Password change error: {e}")
             flash('Failed to change password!', 'danger')
-        finally:
-            if cur: cur.close()
-            if db: db.close()
 
         return redirect(url_for('expert_settings'))
 
@@ -4201,8 +3534,6 @@ def register_user_routes(app):
     def expert_upload_image():
         """Upload profile image for expert"""
         user_id = session['user_id']
-        db = None
-        cur = None
 
         try:
             if 'profile_image' not in request.files:
@@ -4231,10 +3562,9 @@ def register_user_routes(app):
                 return redirect(url_for('expert_settings'))
 
             # Get current user to delete old image
-            db = get_db()
-            cur = db.cursor(dictionary=True)
-            cur.execute("SELECT profile_image FROM users WHERE id = %s", (user_id,))
-            user = cur.fetchone()
+            with get_db_cursor_readonly() as cur:
+                cur.execute("SELECT profile_image FROM users WHERE id = %s", (user_id,))
+                user = cur.fetchone()
 
             # Delete old image if exists
             if user and user.get('profile_image'):
@@ -4256,12 +3586,12 @@ def register_user_routes(app):
             file.save(filepath)
 
             # Update database
-            cur.execute("""
-                UPDATE users 
-                SET profile_image = %s, updated_at = NOW() 
-                WHERE id = %s
-            """, (filename, user_id))
-            db.commit()
+            with get_db_cursor() as cur:
+                cur.execute("""
+                    UPDATE users 
+                    SET profile_image = %s, updated_at = NOW() 
+                    WHERE id = %s
+                """, (filename, user_id))
 
             # Update session
             session['profile_image'] = filename
@@ -4271,9 +3601,6 @@ def register_user_routes(app):
         except Exception as e:
             print(f"Upload image error: {e}")
             flash('Error uploading image', 'danger')
-        finally:
-            if cur: cur.close()
-            if db: db.close()
 
         return redirect(url_for('expert_settings'))
 
@@ -4283,69 +3610,63 @@ def register_user_routes(app):
     @expert_required
     def expert_questions():
         """Expert - View and manage all questions"""
-        db = None
-        cur = None
-
         try:
-            db = get_db()
-            cur = db.cursor(dictionary=True)
-
             # Get filter parameters from request
             selected_crop = request.args.get('crop', '')
-            selected_disease = request.args.get('disease', '')  # Changed from target
+            selected_disease = request.args.get('disease', '')
             selected_category = request.args.get('category', '')
 
-            # Build the base query with your actual columns
-            query = """
-                SELECT q.id, q.crop, q.disease_code, q.question_text, 
-                       q.question_category, q.display_order, q.created_at
-                FROM questions q
-                WHERE 1=1
-            """
-            params = []
+            with get_db_cursor_readonly() as cur:
+                # Build the base query
+                query = """
+                    SELECT q.id, q.crop, q.disease_code, q.question_text, 
+                           q.question_category, q.display_order, q.created_at
+                    FROM questions q
+                    WHERE 1=1
+                """
+                params = []
 
-            # Add filters if provided
-            if selected_crop:
-                query += " AND q.crop = %s"
-                params.append(selected_crop)
+                # Add filters if provided
+                if selected_crop:
+                    query += " AND q.crop = %s"
+                    params.append(selected_crop)
 
-            if selected_disease:
-                query += " AND q.disease_code = %s"
-                params.append(selected_disease)
+                if selected_disease:
+                    query += " AND q.disease_code = %s"
+                    params.append(selected_disease)
 
-            if selected_category:
-                query += " AND q.question_category = %s"
-                params.append(selected_category)
+                if selected_category:
+                    query += " AND q.question_category = %s"
+                    params.append(selected_category)
 
-            # Order by display_order (instead of priority)
-            query += " ORDER BY q.display_order ASC, q.crop, q.disease_code, q.id"
+                query += " ORDER BY q.display_order ASC, q.crop, q.disease_code, q.id"
 
-            # Execute main query
-            cur.execute(query, params)
-            questions = cur.fetchall()
+                # Execute main query
+                cur.execute(query, params)
+                questions = cur.fetchall()
 
-            # Get unique values for filter dropdowns
-            cur.execute("SELECT DISTINCT crop FROM questions WHERE crop IS NOT NULL ORDER BY crop")
-            crops = [row['crop'] for row in cur.fetchall()]
+                # Get unique values for filter dropdowns
+                cur.execute("SELECT DISTINCT crop FROM questions WHERE crop IS NOT NULL ORDER BY crop")
+                crops = [row['crop'] for row in cur.fetchall()]
 
-            cur.execute(
-                "SELECT DISTINCT disease_code FROM questions WHERE disease_code IS NOT NULL ORDER BY disease_code")
-            diseases = [row['disease_code'] for row in cur.fetchall()]
+                cur.execute(
+                    "SELECT DISTINCT disease_code FROM questions WHERE disease_code IS NOT NULL ORDER BY disease_code")
+                diseases = [row['disease_code'] for row in cur.fetchall()]
 
-            cur.execute(
-                "SELECT DISTINCT question_category FROM questions WHERE question_category IS NOT NULL ORDER BY question_category")
-            categories = [row['question_category'] for row in cur.fetchall()]
+                cur.execute(
+                    "SELECT DISTINCT question_category FROM questions WHERE question_category IS NOT NULL ORDER BY question_category")
+                categories = [row['question_category'] for row in cur.fetchall()]
 
-            # Get pending count using the helper function
+            # Get pending count
             pending_count = get_pending_count()
 
             return render_template("expert/questions.html",
                                    questions=questions,
                                    crops=crops,
-                                   diseases=diseases,  # Changed from targets
+                                   diseases=diseases,
                                    categories=categories,
                                    selected_crop=selected_crop,
-                                   selected_disease=selected_disease,  # Changed from selected_target
+                                   selected_disease=selected_disease,
                                    selected_category=selected_category,
                                    pending_count=pending_count,
                                    now=datetime.now())
@@ -4354,11 +3675,6 @@ def register_user_routes(app):
             print(f"Expert questions error: {e}")
             flash('Error loading questions: ' + str(e), 'danger')
             return redirect(url_for('expert_dashboard'))
-        finally:
-            if cur:
-                cur.close()
-            if db:
-                db.close()
 
     @app.route("/expert/questions/add", methods=["GET", "POST"])
     @expert_required
@@ -4366,21 +3682,17 @@ def register_user_routes(app):
         """Add a new question"""
         if request.method == "GET":
             # Show add form
-            db = None
-            cur = None
             try:
-                db = get_db()
-                cur = db.cursor(dictionary=True)
+                with get_db_cursor_readonly() as cur:
+                    # Get existing crops, diseases, and categories for dropdowns
+                    cur.execute("SELECT DISTINCT crop FROM questions ORDER BY crop")
+                    crops = [row['crop'] for row in cur.fetchall()]
 
-                # Get existing crops, diseases, and categories for dropdowns
-                cur.execute("SELECT DISTINCT crop FROM questions ORDER BY crop")
-                crops = [row['crop'] for row in cur.fetchall()]
+                    cur.execute("SELECT DISTINCT disease_code FROM questions ORDER BY disease_code")
+                    diseases = [row['disease_code'] for row in cur.fetchall()]
 
-                cur.execute("SELECT DISTINCT disease_code FROM questions ORDER BY disease_code")
-                diseases = [row['disease_code'] for row in cur.fetchall()]
-
-                cur.execute("SELECT DISTINCT question_category FROM questions ORDER BY question_category")
-                categories = [row['question_category'] for row in cur.fetchall()]
+                    cur.execute("SELECT DISTINCT question_category FROM questions ORDER BY question_category")
+                    categories = [row['question_category'] for row in cur.fetchall()]
 
                 # Get pending count
                 pending_count = get_pending_count()
@@ -4395,13 +3707,8 @@ def register_user_routes(app):
                 print(f"Add question form error: {e}")
                 flash('Error loading form', 'danger')
                 return redirect(url_for('expert_questions'))
-            finally:
-                if cur: cur.close()
-                if db: db.close()
 
         # POST - Process form
-        db = None
-        cur = None
         try:
             crop = request.form.get('crop')
             disease_code = request.form.get('disease_code')
@@ -4414,16 +3721,12 @@ def register_user_routes(app):
                 flash('All fields are required', 'danger')
                 return redirect(url_for('expert_add_question'))
 
-            db = get_db()
-            cur = db.cursor()
-
-            cur.execute("""
-                INSERT INTO questions 
-                (crop, disease_code, question_text, question_category, display_order, created_at)
-                VALUES (%s, %s, %s, %s, %s, NOW())
-            """, (crop, disease_code, question_text, question_category, display_order))
-
-            db.commit()
+            with get_db_cursor() as cur:
+                cur.execute("""
+                    INSERT INTO questions 
+                    (crop, disease_code, question_text, question_category, display_order, created_at)
+                    VALUES (%s, %s, %s, %s, %s, NOW())
+                """, (crop, disease_code, question_text, question_category, display_order))
 
             flash('Question added successfully!', 'success')
             return redirect(url_for('expert_questions'))
@@ -4432,41 +3735,33 @@ def register_user_routes(app):
             print(f"Add question error: {e}")
             flash('Error adding question', 'danger')
             return redirect(url_for('expert_add_question'))
-        finally:
-            if cur: cur.close()
-            if db: db.close()
 
     @app.route("/expert/questions/edit/<int:question_id>", methods=["GET", "POST"])
     @expert_required
     def expert_edit_question(question_id):
         """Edit an existing question"""
-        db = None
-        cur = None
+        if request.method == "GET":
+            try:
+                with get_db_cursor_readonly() as cur:
+                    # Get question details
+                    cur.execute("SELECT * FROM questions WHERE id = %s", (question_id,))
+                    question = cur.fetchone()
 
-        try:
-            db = get_db()
-            cur = db.cursor(dictionary=True)
+                    if not question:
+                        flash('Question not found', 'danger')
+                        return redirect(url_for('expert_questions'))
 
-            if request.method == "GET":
-                # Get question details
-                cur.execute("SELECT * FROM questions WHERE id = %s", (question_id,))
-                question = cur.fetchone()
+                    # Get existing crops, diseases, and categories for dropdowns
+                    cur.execute("SELECT DISTINCT crop FROM questions WHERE crop IS NOT NULL ORDER BY crop")
+                    crops = [row['crop'] for row in cur.fetchall()]
 
-                if not question:
-                    flash('Question not found', 'danger')
-                    return redirect(url_for('expert_questions'))
+                    cur.execute(
+                        "SELECT DISTINCT disease_code FROM questions WHERE disease_code IS NOT NULL ORDER BY disease_code")
+                    diseases = [row['disease_code'] for row in cur.fetchall()]
 
-                # Get existing crops, diseases, and categories for dropdowns
-                cur.execute("SELECT DISTINCT crop FROM questions WHERE crop IS NOT NULL ORDER BY crop")
-                crops = [row['crop'] for row in cur.fetchall()]
-
-                cur.execute(
-                    "SELECT DISTINCT disease_code FROM questions WHERE disease_code IS NOT NULL ORDER BY disease_code")
-                diseases = [row['disease_code'] for row in cur.fetchall()]
-
-                cur.execute(
-                    "SELECT DISTINCT question_category FROM questions WHERE question_category IS NOT NULL ORDER BY question_category")
-                categories = [row['question_category'] for row in cur.fetchall()]
+                    cur.execute(
+                        "SELECT DISTINCT question_category FROM questions WHERE question_category IS NOT NULL ORDER BY question_category")
+                    categories = [row['question_category'] for row in cur.fetchall()]
 
                 # Get pending count
                 pending_count = get_pending_count()
@@ -4479,7 +3774,13 @@ def register_user_routes(app):
                                        pending_count=pending_count,
                                        now=datetime.now())
 
-            # POST - Update question
+            except Exception as e:
+                print(f"Edit question form error: {e}")
+                flash('Error loading form', 'danger')
+                return redirect(url_for('expert_questions'))
+
+        # POST - Update question
+        try:
             crop = request.form.get('crop')
             disease_code = request.form.get('disease_code')
             question_text = request.form.get('question_text')
@@ -4491,18 +3792,16 @@ def register_user_routes(app):
                 flash('All required fields must be filled out!', 'danger')
                 return redirect(url_for('expert_edit_question', question_id=question_id))
 
-            # Update the question
-            cur.execute("""
-                UPDATE questions 
-                SET crop = %s, 
-                    disease_code = %s, 
-                    question_text = %s, 
-                    question_category = %s, 
-                    display_order = %s
-                WHERE id = %s
-            """, (crop, disease_code, question_text, question_category, display_order, question_id))
-
-            db.commit()
+            with get_db_cursor() as cur:
+                cur.execute("""
+                    UPDATE questions 
+                    SET crop = %s, 
+                        disease_code = %s, 
+                        question_text = %s, 
+                        question_category = %s, 
+                        display_order = %s
+                    WHERE id = %s
+                """, (crop, disease_code, question_text, question_category, display_order, question_id))
 
             flash('Question updated successfully!', 'success')
             return redirect(url_for('expert_questions'))
@@ -4511,34 +3810,20 @@ def register_user_routes(app):
             print(f"Edit question error: {e}")
             flash(f'Error updating question: {str(e)}', 'danger')
             return redirect(url_for('expert_edit_question', question_id=question_id))
-        finally:
-            if cur:
-                cur.close()
-            if db:
-                db.close()
 
     @app.route("/expert/questions/delete/<int:question_id>", methods=["POST"])
     @expert_required
     def expert_delete_question(question_id):
         """Delete a question"""
-        db = None
-        cur = None
-
         try:
-            db = get_db()
-            cur = db.cursor()
-
-            cur.execute("DELETE FROM questions WHERE id = %s", (question_id,))
-            db.commit()
+            with get_db_cursor() as cur:
+                cur.execute("DELETE FROM questions WHERE id = %s", (question_id,))
 
             flash('Question deleted successfully!', 'success')
 
         except Exception as e:
             print(f"Delete question error: {e}")
             flash('Error deleting question', 'danger')
-        finally:
-            if cur: cur.close()
-            if db: db.close()
 
         return redirect(url_for('expert_questions'))
 
@@ -4546,9 +3831,6 @@ def register_user_routes(app):
     @expert_required
     def expert_submit_review(diagnosis_id):
         """Submit a review for a diagnosis"""
-        db = None
-        cur = None
-
         try:
             data = request.get_json()
             print(f"Received review data: {data}")
@@ -4573,10 +3855,9 @@ def register_user_routes(app):
                 }), 400
 
             # Set for_training flag based on action
-            # Only accurate diagnoses should be used for training
-            for_training = 1 if action == 'accurate' else 0
+            for_training = True if action == 'accurate' else False
 
-            # Prepare expert summary JSON to store in expert_summary field
+            # Prepare expert summary JSON
             expert_summary = {
                 'notes': expert_notes,
                 'reviewed_at': datetime.now().isoformat(),
@@ -4596,71 +3877,66 @@ def register_user_routes(app):
             # Convert to JSON string for storage
             expert_summary_json = json.dumps(expert_summary)
 
-            db = get_db()
-            cur = db.cursor()
-
-            # First, get the original diagnosis data in case we need it
-            cur.execute("""
-                SELECT user_id, crop, disease_detected, confidence, symptoms, 
-                       recommendations, image 
-                FROM diagnosis_history 
-                WHERE id = %s
-            """, (diagnosis_id,))
-            original_diagnosis = cur.fetchone()
+            with get_db_cursor_readonly() as cur:
+                # First, get the original diagnosis data in case we need it
+                cur.execute("""
+                    SELECT user_id, crop, disease_detected, confidence, symptoms, 
+                           recommendations, image_path
+                    FROM diagnosis_history 
+                    WHERE id = %s
+                """, (diagnosis_id,))
+                original_diagnosis = cur.fetchone()
 
             if not original_diagnosis:
                 return jsonify({'success': False, 'error': 'Diagnosis not found'}), 404
 
-            # Update the diagnosis with review information - REMOVED review_status
-            cur.execute("""
-                UPDATE diagnosis_history 
-                SET expert_review_status = %s,
-                    training_used = 1,
-                    for_training = %s,
-                    expert_summary = %s,
-                    reviewed_at = NOW(),
-                    reviewed_by = %s
-                WHERE id = %s
-            """, (action, for_training, expert_summary_json, session['user_id'], diagnosis_id))
+            with get_db_cursor() as cur:
+                # Update the diagnosis with review information
+                cur.execute("""
+                    UPDATE diagnosis_history 
+                    SET expert_review_status = %s,
+                        training_used = TRUE,
+                        for_training = %s,
+                        expert_summary = %s,
+                        reviewed_at = NOW(),
+                        reviewed_by = %s
+                    WHERE id = %s
+                """, (action, for_training, expert_summary_json, session['user_id'], diagnosis_id))
 
-            db.commit()
-            rows_affected = cur.rowcount
+                rows_affected = cur.rowcount
 
             print(f"✅ Successfully updated diagnosis {diagnosis_id} (rows affected: {rows_affected})")
 
             # If this was a correction, create a new corrected record for training
             if action == 'needs correction' and corrected_disease_id and corrected_disease_name:
                 try:
-                    # Insert a new corrected record that can be used for training
-                    cur.execute("""
-                        INSERT INTO diagnosis_history 
-                        (user_id, crop, disease_detected, confidence, symptoms, recommendations, 
-                         expert_review_status, for_training, image, created_at,
-                         expert_summary)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)
-                    """, (
-                        original_diagnosis['user_id'],
-                        original_diagnosis['crop'],
-                        corrected_disease_name,  # Use the corrected disease name
-                        100.00,  # High confidence for expert-corrected diagnosis
-                        original_diagnosis['symptoms'],
-                        original_diagnosis['recommendations'],
-                        'accurate',  # Mark as accurate since it's expert-corrected
-                        1,  # for_training = 1 (this should be used for training)
-                        original_diagnosis['image'],
-                        json.dumps({
-                            'corrected_from': diagnosis_id,
-                            'corrected_by': session.get('username'),
-                            'correction_notes': expert_notes,
-                            'corrected_at': datetime.now().isoformat()
-                        })
-                    ))
-                    db.commit()
-                    print(f"✅ Created corrected diagnosis record for training")
-
+                    with get_db_cursor() as cur:
+                        cur.execute("""
+                            INSERT INTO diagnosis_history 
+                            (user_id, crop, disease_detected, confidence, symptoms, recommendations, 
+                             expert_review_status, for_training, image_path, created_at,
+                             expert_summary)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)
+                        """, (
+                            original_diagnosis['user_id'],
+                            original_diagnosis['crop'],
+                            corrected_disease_name,
+                            100.00,
+                            original_diagnosis['symptoms'],
+                            original_diagnosis['recommendations'],
+                            'accurate',
+                            True,
+                            original_diagnosis['image_path'],
+                            json.dumps({
+                                'corrected_from': diagnosis_id,
+                                'corrected_by': session.get('username'),
+                                'correction_notes': expert_notes,
+                                'corrected_at': datetime.now().isoformat()
+                            })
+                        ))
+                        print(f"✅ Created corrected diagnosis record for training")
                 except Exception as e:
                     print(f"Warning: Could not create corrected record: {e}")
-                    # Don't fail the main request if this fails
 
             return jsonify({
                 'success': True,
@@ -4673,20 +3949,12 @@ def register_user_routes(app):
             import traceback
             traceback.print_exc()
             return jsonify({'success': False, 'error': str(e)}), 500
-        finally:
-            if cur:
-                cur.close()
-            if db:
-                db.close()
 
     @app.route('/expert/disease-library')
     @login_required
     @expert_required
     def expert_disease_library():
         """Display disease library page for experts"""
-        db = None
-        cursor = None
-
         try:
             crop = request.args.get('crop', 'corn')  # Default to 'corn'
             if crop not in ['corn', 'rice']:
@@ -4696,47 +3964,42 @@ def register_user_routes(app):
             per_page = 12
             offset = (page - 1) * per_page
 
-            db = get_db()
-            cursor = db.cursor(dictionary=True)
+            with get_db_cursor_readonly() as cur:
+                # Get total count for pagination
+                cur.execute("""
+                    SELECT COUNT(*) as total 
+                    FROM disease_info 
+                    WHERE crop = %s
+                """, (crop,))
+                total_result = cur.fetchone()
+                total = total_result['total'] if total_result else 0
 
-            # Get total count for pagination
-            cursor.execute("""
-                SELECT COUNT(*) as total 
-                FROM disease_info 
-                WHERE crop = %s
-            """, (crop,))
-            total_result = cursor.fetchone()
-            total = total_result['total'] if total_result else 0
+                # Get diseases with pagination
+                cur.execute("""
+                    SELECT 
+                        di.id,
+                        di.disease_code,
+                        di.crop,
+                        di.cause,
+                        di.symptoms,
+                        di.organic_treatment,
+                        di.chemical_treatment,
+                        di.prevention,
+                        di.manual_treatment,
+                        di.created_at,
+                        (SELECT COUNT(*) FROM disease_samples 
+                         WHERE disease_code = di.disease_code AND crop = di.crop) as sample_count
+                    FROM disease_info di
+                    WHERE di.crop = %s
+                    ORDER BY di.disease_code
+                    LIMIT %s OFFSET %s
+                """, (crop, per_page, offset))
 
-            # Get diseases with pagination
-            cursor.execute("""
-                SELECT 
-                    di.id,
-                    di.disease_code,
-                    di.crop,
-                    di.cause,
-                    di.symptoms,
-                    di.organic_treatment,
-                    di.chemical_treatment,
-                    di.prevention,
-                    di.manual_treatment,
-                    di.created_at,
-                    (SELECT COUNT(*) FROM disease_samples 
-                     WHERE disease_code = di.disease_code AND crop = di.crop) as sample_count
-                FROM disease_info di
-                WHERE di.crop = %s
-                ORDER BY di.disease_code
-                LIMIT %s OFFSET %s
-            """, (crop, per_page, offset))
+                diseases = cur.fetchall()
 
-            diseases = cursor.fetchall()
-
-            # Get sample images for each disease
-            for disease in diseases:
-                sample_cursor = None
-                try:
-                    sample_cursor = db.cursor(dictionary=True)
-                    sample_cursor.execute("""
+                # Get sample images for each disease
+                for disease in diseases:
+                    cur.execute("""
                         SELECT 
                             id,
                             image_title as title,
@@ -4748,7 +4011,7 @@ def register_user_routes(app):
                         LIMIT 1
                     """, (crop, disease['disease_code']))
 
-                    first_sample = sample_cursor.fetchone()
+                    first_sample = cur.fetchone()
 
                     if first_sample:
                         disease['sample_image'] = url_for('get_disease_sample_image',
@@ -4756,16 +4019,6 @@ def register_user_routes(app):
                                                           _external=False)
                     else:
                         disease['sample_image'] = None
-
-                except Exception as e:
-                    print(f"Error fetching samples: {e}")
-                    disease['sample_image'] = None
-                finally:
-                    if sample_cursor:
-                        try:
-                            sample_cursor.close()
-                        except:
-                            pass
 
             crop_display = 'Corn' if crop == 'corn' else 'Rice'
 
@@ -4799,7 +4052,7 @@ def register_user_routes(app):
             pending_count = get_pending_count()
 
             return render_template(
-                'expert/diseases.html',
+                'expert/disease_library.html',
                 diseases=diseases,
                 crop=crop,
                 crop_display=crop_display,
@@ -4814,49 +4067,35 @@ def register_user_routes(app):
             flash(f'Error loading disease library: {str(e)}', 'danger')
             return redirect(url_for('expert_dashboard'))
 
-        finally:
-            if cursor:
-                try:
-                    cursor.close()
-                except:
-                    pass
-            if db:
-                try:
-                    db.close()
-                except:
-                    pass
-
     # For the diagnosis details endpoint
     @app.route("/api/diagnosis/<int:id>")
     @expert_required
     def get_diagnosis_api(id):
         """Get diagnosis details for review modal"""
-        db = None
-        cur = None
-
         try:
-            db = get_db()
-            cur = db.cursor(dictionary=True)
+            with get_db_cursor_readonly() as cur:
+                cur.execute("""
+                    SELECT dh.*, u.username as farmer_name, u.full_name as farmer_full_name
+                    FROM diagnosis_history dh
+                    JOIN users u ON dh.user_id = u.id
+                    WHERE dh.id = %s
+                """, (id,))
 
-            cur.execute("""
-                SELECT dh.*, u.username as farmer_name, u.full_name as farmer_full_name
-                FROM diagnosis_history dh
-                JOIN users u ON dh.user_id = u.id
-                WHERE dh.id = %s
-            """, (id,))
-
-            diagnosis = cur.fetchone()
+                diagnosis = cur.fetchone()
 
             if not diagnosis:
                 return jsonify({'error': 'Diagnosis not found'}), 404
 
             # Format dates for JSON serialization
             if diagnosis.get('created_at'):
-                diagnosis['created_at'] = diagnosis['created_at'].isoformat()
+                diagnosis['created_at'] = diagnosis['created_at'].isoformat() if hasattr(diagnosis['created_at'],
+                                                                                       'isoformat') else str(
+                    diagnosis['created_at'])
             if diagnosis.get('reviewed_at'):
-                diagnosis['reviewed_at'] = diagnosis['reviewed_at'].isoformat()
+                diagnosis['reviewed_at'] = diagnosis['reviewed_at'].isoformat() if hasattr(diagnosis['reviewed_at'],
+                                                                                          'isoformat') else str(
+                    diagnosis['reviewed_at'])
 
-            # IMPORTANT: Log what's being returned
             print(f"API returning diagnosis {id} with image_path: {diagnosis.get('image_path')}")
 
             return jsonify(diagnosis)
@@ -4864,57 +4103,47 @@ def register_user_routes(app):
         except Exception as e:
             print(f"Error fetching diagnosis: {e}")
             return jsonify({'error': str(e)}), 500
-        finally:
-            if cur: cur.close()
-            if db: db.close()
 
     # For the image endpoint
     @app.route('/api/diagnosis/<int:diagnosis_id>/image')
     @expert_required
     def api_get_diagnosis_image(diagnosis_id):
         """Retrieve and display the diagnosis image from database"""
-        db = None
-        cur = None
-
         try:
-            db = get_db()
-            cur = db.cursor()
+            with get_db_cursor_readonly() as cur:
+                # Get the image path from database
+                cur.execute("SELECT image_path FROM diagnosis_history WHERE id = %s", (diagnosis_id,))
+                result = cur.fetchone()
 
-            # Get the image blob from database
-            cur.execute("SELECT image_path FROM diagnosis_history WHERE id = %s", (diagnosis_id,))
-            result = cur.fetchone()
-
-            if not result or not result[0]:
+            if not result or not result['image_path']:
                 # Return a placeholder image
                 return send_file('static/img/no-image.png', mimetype='image/png')
 
-            image_data = result[0]
+            # Try to find the image file
+            image_path = result['image_path']
+            app_dir = os.path.dirname(os.path.abspath(__file__))
+            
+            # Try different possible locations
+            possible_paths = [
+                os.path.join(app_dir, 'static', 'uploads', image_path),
+                os.path.join(app_dir, 'uploads', image_path),
+                os.path.join(app_dir, 'static', image_path),
+                image_path if os.path.isabs(image_path) else None
+            ]
+            
+            for path in possible_paths:
+                if path and os.path.exists(path):
+                    return send_file(path)
 
-            # Detect image type from first few bytes
-            if image_data.startswith(b'\xff\xd8'):
-                mimetype = 'image/jpeg'
-            elif image_data.startswith(b'\x89PNG\r\n\x1a\n'):
-                mimetype = 'image/png'
-            elif image_data.startswith(b'GIF87a') or image_data.startswith(b'GIF89a'):
-                mimetype = 'image/gif'
-            else:
-                mimetype = 'application/octet-stream'
-
-            # Return the image directly
-            return Response(image_data, mimetype=mimetype)
+            # Return placeholder if file not found
+            return send_file('static/img/no-image.png', mimetype='image/png')
 
         except Exception as e:
             print(f"Error retrieving image: {e}")
-            # Return a placeholder image on error
             return send_file('static/img/error-image.png', mimetype='image/png')
-        finally:
-            if cur:
-                cur.close()
-            if db:
-                db.close()
 
     # ==================== UPLOAD ROUTES ====================
-    # Use a single consistent allowed_file function
+
     def allowed_file(filename):
         """Check if file extension is allowed"""
         ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
@@ -4924,7 +4153,7 @@ def register_user_routes(app):
     @login_required
     @expert_required
     def upload_disease_image():
-        """Upload an image for a disease - stores in LONGBLOB with compression"""
+        """Upload an image for a disease - stores in file system with path in database"""
         print("=" * 50)
         print("UPLOAD DISEASE IMAGE CALLED")
         print("=" * 50)
@@ -4950,36 +4179,6 @@ def register_user_routes(app):
                 return jsonify(
                     {'success': False, 'message': 'File type not allowed. Please upload JPG, PNG, or GIF'}), 400
 
-            # Read and compress the image
-            image_data = file.read()
-
-            # Compress image if it's too large
-            if file_size > 5 * 1024 * 1024:  # If larger than 5MB
-                try:
-                    from PIL import Image
-                    import io
-
-                    # Open image with PIL
-                    img = Image.open(io.BytesIO(image_data))
-
-                    # Convert RGBA to RGB if necessary
-                    if img.mode == 'RGBA':
-                        img = img.convert('RGB')
-
-                    # Calculate new size (reduce if too large)
-                    max_size = (1200, 1200)
-                    img.thumbnail(max_size, Image.Resampling.LANCZOS)
-
-                    # Save compressed image
-                    output = io.BytesIO()
-                    img.save(output, format='JPEG', quality=85, optimize=True)
-                    image_data = output.getvalue()
-
-                    print(f"Image compressed from {file_size} to {len(image_data)} bytes")
-                except Exception as e:
-                    print(f"Compression failed: {e}")
-                    # Continue with original if compression fails
-
             # Get form data
             disease_code = request.form.get('disease_code', '')
             crop = request.form.get('crop', 'corn')
@@ -4992,82 +4191,71 @@ def register_user_routes(app):
             if not sample_id and not disease_code:
                 return jsonify({'success': False, 'message': 'Disease code is required for new samples'}), 400
 
-            db = None
-            cursor = None
+            # Create upload directory
+            upload_dir = os.path.join('static', 'uploads', 'disease_samples', crop, disease_code)
+            os.makedirs(upload_dir, exist_ok=True)
 
-            try:
-                db = get_db()
-                cursor = db.cursor()
+            # Generate unique filename
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            safe_filename = secure_filename(file.filename)
+            filename = f"{timestamp}_{safe_filename}"
+            filepath = os.path.join(upload_dir, filename)
 
+            # Save file
+            file.save(filepath)
+            relative_path = os.path.join('uploads', 'disease_samples', crop, disease_code, filename).replace('\\', '/')
+
+            with get_db_cursor() as cur:
                 if sample_id:
                     # Update existing sample
-                    cursor.execute("""
+                    # Get old image path to delete
+                    cur.execute("SELECT image_path FROM disease_samples WHERE id = %s", (sample_id,))
+                    old_sample = cur.fetchone()
+                    if old_sample and old_sample['image_path']:
+                        old_path = os.path.join('static', old_sample['image_path'])
+                        if os.path.exists(old_path):
+                            os.remove(old_path)
+
+                    cur.execute("""
                         UPDATE disease_samples 
-                        SET image_data = %s, image_title = %s, image_description = %s, severity_level = %s
+                        SET image_path = %s, image_title = %s, image_description = %s, severity_level = %s
                         WHERE id = %s
-                    """, (image_data, image_title, image_description, severity, sample_id))
+                    """, (relative_path, image_title, image_description, severity, sample_id))
                     new_sample_id = sample_id
                     message = 'Sample updated successfully'
                 else:
                     # Get next display order
-                    cursor.execute("""
+                    cur.execute("""
                         SELECT COALESCE(MAX(display_order), 0) + 1 as next_order
                         FROM disease_samples 
                         WHERE crop = %s AND disease_code = %s
                     """, (crop, disease_code))
-                    result = cursor.fetchone()
-                    next_order = result[0] if result else 1
+                    result = cur.fetchone()
+                    next_order = result['next_order'] if result else 1
 
                     # Insert new sample
-                    cursor.execute("""
+                    cur.execute("""
                         INSERT INTO disease_samples (
-                            crop, disease_code, image_data, image_title, 
+                            crop, disease_code, image_path, image_title, 
                             image_description, severity_level, display_order, created_at
                         ) VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
-                    """, (crop, disease_code, image_data, image_title, image_description, severity, next_order))
+                        RETURNING id
+                    """, (crop, disease_code, relative_path, image_title, image_description, severity, next_order))
 
-                    new_sample_id = cursor.lastrowid
+                    new_sample_id = cur.fetchone()['id']
                     message = 'Image uploaded successfully'
 
-                db.commit()
+            # Generate image URL
+            image_url = url_for('static', filename=relative_path, _external=True)
 
-                # Generate image URL
-                image_url = url_for('get_disease_sample_image', sample_id=new_sample_id, _external=True)
+            print(f"✅ Upload successful: sample_id={new_sample_id}")
 
-                print(f"✅ Upload successful: sample_id={new_sample_id}")
-
-                return jsonify({
-                    'success': True,
-                    'sample_id': new_sample_id,
-                    'message': message,
-                    'image_url': image_url
-                })
-
-            except mysql.connector.errors.OperationalError as e:
-                if "max_allowed_packet" in str(e):
-                    return jsonify({
-                        'success': False,
-                        'message': 'Image too large even after compression. Please use a smaller image.'
-                    }), 400
-                raise e
-            except Exception as e:
-                print(f"❌ Database error during upload: {e}")
-                import traceback
-                traceback.print_exc()
-                if db:
-                    db.rollback()
-                return jsonify({'success': False, 'message': f'Database error: {str(e)}'}), 500
-            finally:
-                if cursor:
-                    try:
-                        cursor.close()
-                    except:
-                        pass
-                if db:
-                    try:
-                        db.close()
-                    except:
-                        pass
+            return jsonify({
+                'success': True,
+                'sample_id': new_sample_id,
+                'message': message,
+                'image_url': image_url
+            })
 
         except Exception as e:
             print(f"❌ Unexpected error in upload_disease_image: {e}")
@@ -5091,58 +4279,55 @@ def register_user_routes(app):
                 if not data.get(field):
                     return jsonify({'success': False, 'message': f'{field} is required'}), 400
 
-            db = get_db()
-            cursor = db.cursor()
+            with get_db_cursor_readonly() as cur:
+                # Check if disease code exists in disease_info
+                cur.execute(
+                    "SELECT id FROM disease_info WHERE disease_code = %s AND crop = %s",
+                    (data['disease_code'], data['crop'])
+                )
+                if cur.fetchone():
+                    return jsonify({'success': False, 'message': 'Disease code already exists'}), 400
 
-            # Check if disease code exists in disease_info
-            cursor.execute(
-                "SELECT id FROM disease_info WHERE disease_code = %s AND crop = %s",
-                (data['disease_code'], data['crop'])
-            )
-            if cursor.fetchone():
-                return jsonify({'success': False, 'message': 'Disease code already exists'}), 400
-
-            # Insert into disease_info
-            cursor.execute("""
-                INSERT INTO disease_info (
-                    disease_code, crop, cause, symptoms,
-                    organic_treatment, chemical_treatment, prevention, manual_treatment,
-                    created_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
-            """, (
-                data['disease_code'],
-                data['crop'],
-                data['cause'],
-                data['symptoms'],
-                data.get('organic_treatment'),
-                data.get('chemical_treatment'),
-                data.get('prevention'),
-                data.get('manual_treatment')
-            ))
-
-            disease_id = cursor.lastrowid
-
-            # If sample image provided, add to disease_samples
-            if data.get('sample_image'):
-                cursor.execute("""
-                    INSERT INTO disease_samples (
-                        disease_code, crop, image_path, 
-                        severity_level, display_order, created_at
-                    ) VALUES (%s, %s, %s, %s, %s, NOW())
+            with get_db_cursor() as cur:
+                # Insert into disease_info
+                cur.execute("""
+                    INSERT INTO disease_info (
+                        disease_code, crop, cause, symptoms,
+                        organic_treatment, chemical_treatment, prevention, manual_treatment,
+                        created_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                    RETURNING id
                 """, (
                     data['disease_code'],
                     data['crop'],
-                    data['sample_image'],
-                    data.get('severity_level', 'Early'),
-                    1
+                    data['cause'],
+                    data['symptoms'],
+                    data.get('organic_treatment'),
+                    data.get('chemical_treatment'),
+                    data.get('prevention'),
+                    data.get('manual_treatment')
                 ))
 
-            db.commit()
+                disease_id = cur.fetchone()['id']
+
+                # If sample image provided, add to disease_samples
+                if data.get('sample_image'):
+                    cur.execute("""
+                        INSERT INTO disease_samples (
+                            disease_code, crop, image_path, 
+                            severity_level, display_order, created_at
+                        ) VALUES (%s, %s, %s, %s, %s, NOW())
+                    """, (
+                        data['disease_code'],
+                        data['crop'],
+                        data['sample_image'],
+                        data.get('severity_level', 'Early'),
+                        1
+                    ))
 
             return jsonify({'success': True, 'id': disease_id, 'message': 'Disease added successfully'}), 201
 
         except Exception as e:
-            db.rollback()
             return jsonify({'success': False, 'message': str(e)}), 500
 
     @app.route('/api/disease/<string:disease_code>', methods=['GET'])
@@ -5151,35 +4336,34 @@ def register_user_routes(app):
         """Get disease by disease_code from disease_info with sample images"""
         try:
             crop = request.args.get('crop', 'corn')
-            db = get_db()
-            cursor = db.cursor(dictionary=True)
+            with get_db_cursor_readonly() as cur:
+                # Get disease info from disease_info table
+                cur.execute("""
+                    SELECT * FROM disease_info 
+                    WHERE crop = %s AND disease_code = %s
+                """, (crop, disease_code))
 
-            # Get disease info from disease_info table
-            cursor.execute("""
-                SELECT * FROM disease_info 
-                WHERE crop = %s AND disease_code = %s
-            """, (crop, disease_code))
+                disease = cur.fetchone()
 
-            disease = cursor.fetchone()
+                if not disease:
+                    return jsonify({'success': False, 'message': 'Disease not found'}), 404
 
-            if not disease:
-                return jsonify({'success': False, 'message': 'Disease not found'}), 404
+                # Get sample images from disease_samples
+                cur.execute("""
+                    SELECT id, image_path, image_title, image_description, severity_level, display_order
+                    FROM disease_samples 
+                    WHERE crop = %s AND disease_code = %s
+                    ORDER BY display_order
+                """, (crop, disease_code))
 
-            # Get sample images from disease_samples - now without image_data
-            cursor.execute("""
-                SELECT id, image_title, image_description, severity_level, display_order
-                FROM disease_samples 
-                WHERE crop = %s AND disease_code = %s
-                ORDER BY display_order
-            """, (crop, disease_code))
+                samples = cur.fetchall()
 
-            samples = cursor.fetchall()
+                # Create image URLs
+                for sample in samples:
+                    if sample['image_path']:
+                        sample['image_url'] = url_for('static', filename=sample['image_path'])
 
-            # For each sample, create an image URL using the image serving route
-            for sample in samples:
-                sample['image_url'] = url_for('get_disease_sample_image', sample_id=sample['id'])
-
-            disease['samples'] = samples
+                disease['samples'] = samples
 
             return jsonify({'success': True, 'disease': disease})
 
@@ -5188,9 +4372,6 @@ def register_user_routes(app):
             import traceback
             traceback.print_exc()
             return jsonify({'success': False, 'message': str(e)}), 500
-        finally:
-            if cursor: cursor.close()
-            if db: db.close()
 
     @app.route('/api/disease/<string:disease_code>', methods=['PUT'])
     @login_required
@@ -5200,57 +4381,32 @@ def register_user_routes(app):
         try:
             data = request.json
             crop = data.get('crop', 'corn')
-            db = get_db()
-            cursor = db.cursor()
 
-            # Check if disease exists
-            cursor.execute(
-                "SELECT id FROM disease_info WHERE crop = %s AND disease_code = %s",
-                (crop, disease_code)
-            )
-            if not cursor.fetchone():
-                return jsonify({'success': False, 'message': 'Disease not found'}), 404
-
-            # Update disease_info
-            cursor.execute("""
-                UPDATE disease_info 
-                SET cause = %s,
-                    symptoms = %s,
-                    organic_treatment = %s,
-                    chemical_treatment = %s,
-                    prevention = %s,
-                    manual_treatment = %s
-                WHERE crop = %s AND disease_code = %s
-            """, (
-                data.get('cause'),
-                data.get('symptoms'),
-                data.get('organic_treatment'),
-                data.get('chemical_treatment'),
-                data.get('prevention'),
-                data.get('manual_treatment'),
-                crop,
-                disease_code
-            ))
-
-            # Update first sample's image if provided
-            if data.get('sample_image'):
-                cursor.execute("""
-                    UPDATE disease_samples 
-                    SET image_path = %s
-                    WHERE crop = %s AND disease_code = %s 
-                    ORDER BY display_order LIMIT 1
+            with get_db_cursor() as cur:
+                # Update disease_info
+                cur.execute("""
+                    UPDATE disease_info 
+                    SET cause = %s,
+                        symptoms = %s,
+                        organic_treatment = %s,
+                        chemical_treatment = %s,
+                        prevention = %s,
+                        manual_treatment = %s
+                    WHERE crop = %s AND disease_code = %s
                 """, (
-                    data['sample_image'],
+                    data.get('cause'),
+                    data.get('symptoms'),
+                    data.get('organic_treatment'),
+                    data.get('chemical_treatment'),
+                    data.get('prevention'),
+                    data.get('manual_treatment'),
                     crop,
                     disease_code
                 ))
 
-            db.commit()
-
             return jsonify({'success': True, 'message': 'Disease updated successfully'})
 
         except Exception as e:
-            db.rollback()
             return jsonify({'success': False, 'message': str(e)}), 500
 
     @app.route('/api/disease/<string:disease_code>', methods=['DELETE'])
@@ -5260,30 +4416,26 @@ def register_user_routes(app):
         """Delete disease from both tables"""
         try:
             crop = request.args.get('crop', 'corn')
-            db = get_db()
-            cursor = db.cursor()
 
-            # First delete from disease_samples
-            cursor.execute(
-                "DELETE FROM disease_samples WHERE crop = %s AND disease_code = %s",
-                (crop, disease_code)
-            )
+            with get_db_cursor() as cur:
+                # First delete from disease_samples
+                cur.execute(
+                    "DELETE FROM disease_samples WHERE crop = %s AND disease_code = %s",
+                    (crop, disease_code)
+                )
 
-            # Then delete from disease_info
-            cursor.execute(
-                "DELETE FROM disease_info WHERE crop = %s AND disease_code = %s",
-                (crop, disease_code)
-            )
+                # Then delete from disease_info
+                cur.execute(
+                    "DELETE FROM disease_info WHERE crop = %s AND disease_code = %s",
+                    (crop, disease_code)
+                )
 
-            db.commit()
-
-            if cursor.rowcount == 0:
-                return jsonify({'success': False, 'message': 'Disease not found'}), 404
+                if cur.rowcount == 0:
+                    return jsonify({'success': False, 'message': 'Disease not found'}), 404
 
             return jsonify({'success': True, 'message': 'Disease deleted successfully'})
 
         except Exception as e:
-            db.rollback()
             return jsonify({'success': False, 'message': str(e)}), 500
 
     @app.route('/api/disease-info', methods=['GET'])
@@ -5296,40 +4448,40 @@ def register_user_routes(app):
             if not crop or not disease_code:
                 return jsonify({'success': False, 'message': 'Missing parameters'}), 400
 
-            db = get_db()
-            cursor = db.cursor(dictionary=True)
+            with get_db_cursor_readonly() as cur:
+                # Get disease info from disease_info
+                cur.execute("""
+                    SELECT * FROM disease_info 
+                    WHERE crop = %s AND disease_code = %s
+                """, (crop, disease_code))
 
-            # Get disease info from disease_info
-            cursor.execute("""
-                SELECT * FROM disease_info 
-                WHERE crop = %s AND disease_code = %s
-            """, (crop, disease_code))
+                disease = cur.fetchone()
 
-            disease = cursor.fetchone()
+                if not disease:
+                    return jsonify({'success': False, 'message': 'Disease not found'}), 404
 
-            if not disease:
-                return jsonify({'success': False, 'message': 'Disease not found'}), 404
+                # Get all sample images from disease_samples (without the BLOB data)
+                cur.execute("""
+                    SELECT 
+                        id,
+                        image_path,
+                        image_title as title,
+                        severity_level as severity,
+                        display_order
+                    FROM disease_samples 
+                    WHERE crop = %s AND disease_code = %s
+                    ORDER BY display_order
+                """, (crop, disease_code))
 
-            # Get all sample images from disease_samples (without the BLOB data)
-            cursor.execute("""
-                SELECT 
-                    id,
-                    image_title as title,
-                    severity_level as severity,
-                    display_order
-                FROM disease_samples 
-                WHERE crop = %s AND disease_code = %s
-                ORDER BY display_order
-            """, (crop, disease_code))
+                samples = cur.fetchall()
 
-            samples = cursor.fetchall()
+                # Create image URLs for each sample
+                for sample in samples:
+                    if sample['image_path']:
+                        sample['url'] = url_for('static', filename=sample['image_path'])
 
-            # Create image URLs for each sample
-            for sample in samples:
-                sample['url'] = url_for('get_disease_sample_image', sample_id=sample['id'])
-
-            # Use disease_code as display name since disease_name doesn't exist
-            display_name = f"Disease {disease_code.replace('_', ' ').title()}"
+                # Use disease_code as display name since disease_name doesn't exist
+                display_name = f"Disease {disease_code.replace('_', ' ').title()}"
 
             return jsonify({
                 'success': True,
@@ -5341,7 +4493,7 @@ def register_user_routes(app):
                 'chemical_treatment': disease['chemical_treatment'] or 'Contact local agricultural expert',
                 'prevention': disease['prevention'] or 'Regular monitoring and early detection',
                 'manual_treatment': disease['manual_treatment'] or '',
-                'image_url': samples[0]['url'] if samples else None,
+                'image_url': samples[0]['url'] if samples and samples[0]['image_path'] else None,
                 'sample_images': samples,
                 'last_updated': disease['created_at']
             })
@@ -5351,16 +4503,13 @@ def register_user_routes(app):
             import traceback
             traceback.print_exc()
             return jsonify({'success': False, 'message': str(e)}), 500
-        finally:
-            if cursor: cursor.close()
-            if db: db.close()
 
     class SimplePagination:
         def __init__(self, page, per_page, total):
             self.page = page
             self.per_page = per_page
             self.total = total
-            self.pages = (total + per_page - 1) // per_page
+            self.pages = (total + per_page - 1) // per_page if total > 0 else 1
             self.has_prev = page > 1
             self.has_next = page < self.pages
             self.prev_num = page - 1
@@ -5381,150 +4530,102 @@ def register_user_routes(app):
     @app.route('/api/disease-sample-image/<int:sample_id>')
     @login_required
     def get_disease_sample_image(sample_id):
-        """Serve disease sample image from BLOB"""
-        db = None
-        cur = None
-
+        """Serve disease sample image from file system"""
         try:
-            db = get_db()
-            cur = db.cursor()
+            with get_db_cursor_readonly() as cur:
+                cur.execute("""
+                    SELECT image_path 
+                    FROM disease_samples 
+                    WHERE id = %s
+                """, (sample_id,))
+                result = cur.fetchone()
 
-            # Get the image data
-            cur.execute("""
-                SELECT image_data, image_title 
-                FROM disease_samples 
-                WHERE id = %s
-            """, (sample_id,))
-
-            result = cur.fetchone()
-
-            if not result or not result[0]:
+            if not result or not result['image_path']:
                 # Return a placeholder if no image
                 return send_file('static/img/no-image.png', mimetype='image/png')
 
-            image_data = result[0]
-
-            # Detect image type from first few bytes
-            if image_data.startswith(b'\xff\xd8'):
-                mimetype = 'image/jpeg'
-            elif image_data.startswith(b'\x89PNG\r\n\x1a\n'):
-                mimetype = 'image/png'
-            elif image_data.startswith(b'GIF87a') or image_data.startswith(b'GIF89a'):
-                mimetype = 'image/gif'
+            image_path = result['image_path']
+            app_dir = os.path.dirname(os.path.abspath(__file__))
+            
+            # Construct full path
+            full_path = os.path.join(app_dir, 'static', image_path)
+            
+            if os.path.exists(full_path):
+                return send_file(full_path)
             else:
-                mimetype = 'application/octet-stream'
-
-            # Return the image directly
-            return Response(image_data, mimetype=mimetype)
+                return send_file('static/img/no-image.png', mimetype='image/png')
 
         except Exception as e:
             print(f"Error retrieving disease sample image: {e}")
             return send_file('static/img/error-image.png', mimetype='image/png')
-        finally:
-            # CRITICAL: Always close connections
-            if cur:
-                try:
-                    cur.close()
-                except:
-                    pass
-            if db:
-                try:
-                    db.close()
-                except:
-                    pass
 
     @app.route('/api/disease-sample/<int:sample_id>', methods=['PUT'])
     @login_required
     @expert_required
     def update_disease_sample(sample_id):
         """Update sample metadata (not the image itself)"""
-        db = None
-        cursor = None
-
         try:
             data = request.json
             if not data:
                 return jsonify({'success': False, 'message': 'No data provided'}), 400
 
-            db = get_db()
-            cursor = db.cursor()
+            with get_db_cursor() as cur:
+                update_fields = []
+                values = []
 
-            update_fields = []
-            values = []
+                # Update only metadata fields
+                for field in ['image_title', 'image_description', 'severity_level']:
+                    if field in data:
+                        update_fields.append(f"{field} = %s")
+                        values.append(data[field])
 
-            # Update only metadata fields, not image_data
-            for field in ['image_title', 'image_description', 'severity_level']:
-                if field in data:
-                    update_fields.append(f"{field} = %s")
-                    values.append(data[field])
+                if not update_fields:
+                    return jsonify({'success': False, 'message': 'No fields to update'}), 400
 
-            if not update_fields:
-                return jsonify({'success': False, 'message': 'No fields to update'}), 400
-
-            values.append(sample_id)
-            cursor.execute(f"UPDATE disease_samples SET {', '.join(update_fields)} WHERE id = %s", values)
-            db.commit()
+                values.append(sample_id)
+                cur.execute(f"UPDATE disease_samples SET {', '.join(update_fields)} WHERE id = %s", values)
 
             return jsonify({'success': True, 'message': 'Sample updated successfully'})
 
         except Exception as e:
             print(f"Error updating sample: {e}")
-            if db:
-                db.rollback()
             return jsonify({'success': False, 'message': str(e)}), 500
-        finally:
-            if cursor:
-                try:
-                    cursor.close()
-                except:
-                    pass
-            if db:
-                try:
-                    db.close()
-                except:
-                    pass
 
     @app.route('/api/disease/<string:disease_code>/samples', methods=['POST'])
     @login_required
     @expert_required
     def add_sample(disease_code):
-        """Add a new sample image for a disease (using BLOB)"""
+        """Add a new sample image for a disease"""
         try:
             data = request.json
             crop = data.get('crop', 'corn')
 
-            db = get_db()
-            cursor = db.cursor()
+            with get_db_cursor() as cur:
+                # Get max display order
+                cur.execute("""
+                    SELECT MAX(display_order) as max_order 
+                    FROM disease_samples 
+                    WHERE crop = %s AND disease_code = %s
+                """, (crop, disease_code))
+                result = cur.fetchone()
+                next_order = (result['max_order'] or 0) + 1
 
-            # Get max display order
-            cursor.execute("""
-                SELECT MAX(display_order) as max_order 
-                FROM disease_samples 
-                WHERE crop = %s AND disease_code = %s
-            """, (crop, disease_code))
-            result = cursor.fetchone()
-            next_order = (result[0] or 0) + 1
+                cur.execute("""
+                    INSERT INTO disease_samples (
+                        disease_code, crop, image_path, image_title,
+                        severity_level, display_order, created_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                    RETURNING id
+                """, (
+                    disease_code,
+                    crop,
+                    data.get('image_path'),
+                    data.get('image_title', ''),
+                    data.get('severity_level', 'Moderate'),
+                    next_order
+                ))
 
-            # For BLOB storage, we need to handle image data differently
-            # This route might need to accept a file upload instead of JSON
-            # Alternatively, you could first upload the image to a temporary file
-
-            cursor.execute("""
-                INSERT INTO disease_samples (
-                    disease_code, crop, image_data, image_title,
-                    severity_level, display_order, created_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, NOW())
-            """, (
-                disease_code,
-                crop,
-                data.get('image_data'),  # This should be binary data
-                data.get('image_title', ''),
-                data.get('severity_level', 'Moderate'),
-                next_order
-            ))
-
-            sample_id = cursor.lastrowid
-            db.commit()
+                sample_id = cur.fetchone()['id']
 
             return jsonify({
                 'success': True,
@@ -5534,48 +4635,36 @@ def register_user_routes(app):
             }), 201
 
         except Exception as e:
-            db.rollback()
             print(f"Error adding sample: {e}")
             import traceback
             traceback.print_exc()
             return jsonify({'success': False, 'message': str(e)}), 500
-        finally:
-            if cursor: cursor.close()
-            if db: db.close()
 
     @app.route('/api/disease-sample/<int:sample_id>', methods=['DELETE'])
     @login_required
     @expert_required
     def delete_disease_sample(sample_id):
         """Delete a disease sample"""
-        db = None
-        cursor = None
-
         try:
-            db = get_db()
-            cursor = db.cursor()
+            with get_db_cursor() as cur:
+                # Get image path to delete file
+                cur.execute("SELECT image_path FROM disease_samples WHERE id = %s", (sample_id,))
+                sample = cur.fetchone()
 
-            cursor.execute("DELETE FROM disease_samples WHERE id = %s", (sample_id,))
-            db.commit()
+                if sample and sample['image_path']:
+                    # Delete file
+                    filepath = os.path.join('static', sample['image_path'])
+                    if os.path.exists(filepath):
+                        os.remove(filepath)
+
+                # Delete database record
+                cur.execute("DELETE FROM disease_samples WHERE id = %s", (sample_id,))
 
             return jsonify({'success': True, 'message': 'Sample deleted successfully'})
 
         except Exception as e:
             print(f"Error deleting sample: {e}")
-            if db:
-                db.rollback()
             return jsonify({'success': False, 'message': str(e)}), 500
-        finally:
-            if cursor:
-                try:
-                    cursor.close()
-                except:
-                    pass
-            if db:
-                try:
-                    db.close()
-                except:
-                    pass
 
     # ========== ADMIN DISEASE LIBRARY ==========
     @app.route("/admin/disease-library")
@@ -5587,65 +4676,61 @@ def register_user_routes(app):
             page = request.args.get('page', 1, type=int)
             per_page = 12
 
-            db = get_db()
-            cur = db.cursor(dictionary=True)
-
             offset = (page - 1) * per_page
 
-            # FIXED: Removed image_path from query since it doesn't exist
-            cur.execute("""
-                SELECT 
-                    di.*,
-                    (SELECT COUNT(*) FROM disease_samples 
-                     WHERE disease_code = di.disease_code AND crop = di.crop) as sample_count
-                FROM disease_info di
-                WHERE di.crop = %s
-                ORDER BY di.disease_code
-                LIMIT %s OFFSET %s
-            """, (crop, per_page, offset))
-            diseases = cur.fetchall()
-
-            cur.execute("SELECT COUNT(*) as total FROM disease_info WHERE crop = %s", (crop,))
-            total = cur.fetchone()['total'] or 0
-
-            # FIXED: For each disease, get sample count but NOT image_path
-            # Instead, we'll create image URLs using the serving route
-            for disease in diseases:
+            with get_db_cursor_readonly() as cur:
                 cur.execute("""
-                    SELECT id 
-                    FROM disease_samples 
-                    WHERE crop = %s AND disease_code = %s 
-                    ORDER BY display_order LIMIT 1
-                """, (crop, disease['disease_code']))
-                sample = cur.fetchone()
-                if sample:
-                    # Create URL to serve the image from BLOB
-                    disease['sample_image'] = url_for('get_disease_sample_image', sample_id=sample['id'])
-                else:
-                    disease['sample_image'] = None
+                    SELECT 
+                        di.*,
+                        (SELECT COUNT(*) FROM disease_samples 
+                         WHERE disease_code = di.disease_code AND crop = di.crop) as sample_count
+                    FROM disease_info di
+                    WHERE di.crop = %s
+                    ORDER BY di.disease_code
+                    LIMIT %s OFFSET %s
+                """, (crop, per_page, offset))
+                diseases = cur.fetchall()
 
-            # Get crop statistics
-            cur.execute("SELECT COUNT(*) as count FROM disease_info WHERE crop = 'corn'")
-            corn_count = cur.fetchone()['count'] or 0
-            cur.execute("SELECT COUNT(*) as count FROM disease_info WHERE crop = 'rice'")
-            rice_count = cur.fetchone()['count'] or 0
-            crop_stats = {'corn_count': corn_count, 'rice_count': rice_count}
+                cur.execute("SELECT COUNT(*) as total FROM disease_info WHERE crop = %s", (crop,))
+                total = cur.fetchone()['total'] or 0
 
-            # Get sidebar stats
-            cur.execute("SELECT COUNT(*) as count FROM users WHERE is_active = 0")
-            pending_users = cur.fetchone()['count'] or 0
-            cur.execute("SELECT COUNT(*) as count FROM feedback WHERE status = 'pending'")
-            pending_feedback = cur.fetchone()['count'] or 0
-            cur.execute("SELECT COUNT(*) as count FROM diagnosis_history WHERE expert_review_status = 'pending'")
-            pending_reviews = cur.fetchone()['count'] or 0
-            try:
-                cur.execute("SELECT COUNT(*) as count FROM disease_info WHERE status = 'pending'")
-                pending_diseases = cur.fetchone()['count'] or 0
-            except:
-                pending_diseases = 0
+                # For each disease, get sample image
+                for disease in diseases:
+                    cur.execute("""
+                        SELECT id, image_path
+                        FROM disease_samples 
+                        WHERE crop = %s AND disease_code = %s 
+                        ORDER BY display_order LIMIT 1
+                    """, (crop, disease['disease_code']))
+                    sample = cur.fetchone()
+                    if sample:
+                        # Create URL to serve the image
+                        if sample['image_path']:
+                            disease['sample_image'] = url_for('static', filename=sample['image_path'])
+                        else:
+                            disease['sample_image'] = url_for('get_disease_sample_image', sample_id=sample['id'])
+                    else:
+                        disease['sample_image'] = None
 
-            cur.close()
-            db.close()
+                # Get crop statistics
+                cur.execute("SELECT COUNT(*) as count FROM disease_info WHERE crop = 'corn'")
+                corn_count = cur.fetchone()['count'] or 0
+                cur.execute("SELECT COUNT(*) as count FROM disease_info WHERE crop = 'rice'")
+                rice_count = cur.fetchone()['count'] or 0
+                crop_stats = {'corn_count': corn_count, 'rice_count': rice_count}
+
+                # Get sidebar stats
+                cur.execute("SELECT COUNT(*) as count FROM users WHERE is_active = FALSE")
+                pending_users = cur.fetchone()['count'] or 0
+                cur.execute("SELECT COUNT(*) as count FROM feedback WHERE status = 'pending'")
+                pending_feedback = cur.fetchone()['count'] or 0
+                cur.execute("SELECT COUNT(*) as count FROM diagnosis_history WHERE expert_review_status = 'pending'")
+                pending_reviews = cur.fetchone()['count'] or 0
+                try:
+                    cur.execute("SELECT COUNT(*) as count FROM disease_info WHERE status = 'pending'")
+                    pending_diseases = cur.fetchone()['count'] or 0
+                except:
+                    pending_diseases = 0
 
             crop_display = 'Corn' if crop == 'corn' else 'Rice'
 
@@ -5696,81 +4781,44 @@ def register_user_routes(app):
             traceback.print_exc()
             flash(f'Error loading disease library: {str(e)}', 'danger')
             return redirect(url_for('admin_dashboard'))
-        finally:
-            # Ensure connections are closed even if error occurs
-            if 'cur' in locals() and cur:
-                try:
-                    cur.close()
-                except:
-                    pass
-            if 'db' in locals() and db:
-                try:
-                    db.close()
-                except:
-                    pass
+
     # ========== HELPER FUNCTION ==========
 
     @app.context_processor
     def inject_pending_count():
         """Make pending_count available to all expert templates automatically"""
         if session.get('user_type') == 'expert':
-            db = None
-            cur = None
             try:
-                db = get_db()
-                cur = db.cursor(dictionary=True)
-
-                # SIMPLE COUNT - no expert_id needed
-                cur.execute(
-                    "SELECT COUNT(*) as count FROM diagnosis_history WHERE expert_review_status = 'pending' OR expert_review_status IS NULL")
-                result = cur.fetchone()
-                count = result['count'] if result else 0
-
-                return {'pending_count': count}
+                with get_db_cursor_readonly() as cur:
+                    cur.execute(
+                        "SELECT COUNT(*) as count FROM diagnosis_history WHERE expert_review_status = 'pending' OR expert_review_status IS NULL")
+                    result = cur.fetchone()
+                    count = result['count'] if result else 0
+                    return {'pending_count': count}
             except Exception as e:
                 print(f"Error getting pending count: {e}")
                 return {'pending_count': 0}
-            finally:
-                if cur:
-                    cur.close()
-                if db:
-                    db.close()
         return {'pending_count': 0}
 
     def save_diagnosis_to_history(user_id, crop, disease_detected, confidence,
                                   image_path, symptoms, recommendations, location=None):
         """Save diagnosis to history table"""
-        db = None
-        cur = None
-
         try:
-            db = get_db()
-            cur = db.cursor()
+            with get_db_cursor() as cur:
+                cur.execute("""
+                    INSERT INTO diagnosis_history 
+                    (user_id, crop, disease_detected, confidence, image_path, 
+                     symptoms, recommendations, location, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                    RETURNING id
+                """, (user_id, crop, disease_detected, confidence, image_path,
+                      symptoms, recommendations, location or session.get('location')))
 
-            cur.execute("""
-                INSERT INTO diagnosis_history 
-                (user_id, crop, disease_detected, confidence, image_path, 
-                 symptoms, recommendations, location)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            """, (user_id, crop, disease_detected, confidence, image_path,
-                  symptoms, recommendations, location or session.get('location')))
-
-            db.commit()
-            return cur.lastrowid
+                result = cur.fetchone()
+                return result['id'] if result else None
 
         except Exception as e:
             print(f"Error saving diagnosis to history: {e}")
             return None
-        finally:
-            if cur:
-                try:
-                    cur.close()
-                except:
-                    pass
-            if db:
-                try:
-                    db.close()
-                except:
-                    pass
 
     return app
