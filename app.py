@@ -149,6 +149,92 @@ def save_exported_training_data(diagnosis_ids):
         print(f"❌ Error marking training data: {e}")
         return False
 
+@app.route('/create-admin')
+def create_admin():
+    """Create admin user - REMOVE AFTER USE!"""
+    # Security: Simple secret to prevent unauthorized access
+    secret = request.args.get('secret', '')
+    if secret != 'create-admin-now':
+        return "Unauthorized. Use ?secret=create-admin-now", 401
+    
+    try:
+        from auth import hash_password
+        from db_config import get_db_cursor
+        
+        admin_username = "Administrator"
+        admin_password = "Admin123"
+        admin_email = "admin@agriaid.com"
+        
+        # Hash the password
+        hashed_password = hash_password(admin_password)
+        
+        with get_db_cursor() as cursor:
+            # Check if admin already exists
+            cursor.execute("SELECT id FROM users WHERE username = %s OR email = %s", 
+                          (admin_username, admin_email))
+            existing = cursor.fetchone()
+            
+            if existing:
+                return f"""
+                <html>
+                <body>
+                    <h2>⚠️ Admin user already exists!</h2>
+                    <p>Username 'Administrator' or email 'admin@agriaid.com' is already taken.</p>
+                    <a href="/login">Go to Login</a>
+                </body>
+                </html>
+                """
+            
+            # Create admin user
+            cursor.execute("""
+                INSERT INTO users 
+                (username, email, password_hash, full_name, user_type, is_active, is_admin, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+                RETURNING id
+            """, (admin_username, admin_email, hashed_password, 'System Administrator', 'admin', True, True))
+            
+            user_id = cursor.fetchone()['id']
+            
+            # Create user settings
+            try:
+                cursor.execute("""
+                    INSERT INTO user_settings (user_id) VALUES (%s)
+                """, (user_id,))
+            except:
+                pass  # Settings table might not exist
+        
+        return f"""
+        <html>
+        <head>
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 40px; line-height: 1.6; }}
+                .success {{ color: green; font-weight: bold; }}
+                .info {{ background: #f4f4f4; padding: 20px; border-radius: 5px; }}
+                .warning {{ color: orange; }}
+            </style>
+        </head>
+        <body>
+            <h1 class="success">✅ Admin User Created Successfully!</h1>
+            <div class="info">
+                <h3>Admin Credentials:</h3>
+                <p><strong>Username:</strong> Administrator</p>
+                <p><strong>Password:</strong> Admin123</p>
+                <p><strong>Email:</strong> admin@agriaid.com</p>
+            </div>
+            <p class="warning"><strong>⚠️ IMPORTANT:</strong> Delete this route after use!</p>
+            <p><a href="/login">Go to Login Page</a></p>
+        </body>
+        </html>
+        """
+        
+    except Exception as e:
+        return f"""
+        <html>
+        <body>
+            <h2 style="color:red;">❌ Error creating admin: {str(e)}</h2>
+        </body>
+        </html>
+        """
 
 # ========== IMAGE SERVING ROUTE ==========
 @app.route('/diagnosis-image/<int:diagnosis_id>')
