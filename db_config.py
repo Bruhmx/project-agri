@@ -6,6 +6,7 @@ from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
 from contextlib import contextmanager
 import time
+import ssl
 
 load_dotenv()
 
@@ -13,42 +14,57 @@ load_dotenv()
 connection_pool = None
 
 def init_db_pool():
-    """Initialize the PostgreSQL connection pool"""
+    """Initialize the PostgreSQL connection pool with proper SSL"""
     global connection_pool
     
     try:
         # Get database URL from environment (Render provides this)
         database_url = os.getenv('DATABASE_URL')
         
+        if not database_url:
+            print("❌ DATABASE_URL not found in environment variables")
+            return False
+            
+        print(f"🔌 Connecting to database...")
+        
         # Render provides DATABASE_URL, but it might start with postgres://
         # psycopg2 requires postgresql://
-        if database_url and database_url.startswith('postgres://'):
+        if database_url.startswith('postgres://'):
             database_url = database_url.replace('postgres://', 'postgresql://', 1)
+            print("🔄 Converted postgres:// to postgresql://")
         
-        if database_url:
-            # Use the connection string directly
-            connection_pool = psycopg2.pool.SimpleConnectionPool(
-                1,  # min connections
-                5,  # max connections (reduced for free tier)
-                dsn=database_url
-            )
-            print(f"✅ PostgreSQL connection pool created using DATABASE_URL")
-        else:
-            # Fallback to individual parameters
-            db_config = {
-                "host": os.getenv("DB_HOST", "localhost"),
-                "user": os.getenv("DB_USER", "postgres"),
-                "password": os.getenv("DB_PASSWORD", ""),
-                "database": os.getenv("DB_NAME", "agriaid"),
-                "port": int(os.getenv("DB_PORT", 5432)),
-            }
-            
-            connection_pool = psycopg2.pool.SimpleConnectionPool(
-                1, 5, **db_config
-            )
-            print(f"✅ PostgreSQL connection pool created with parameters")
+        # IMPORTANT: Add SSL mode to the connection string if not present
+        if 'sslmode' not in database_url:
+            # Add ? or & depending on whether there are already parameters
+            if '?' in database_url:
+                database_url += '&sslmode=require'
+            else:
+                database_url += '?sslmode=require'
+            print("🔒 Added SSL mode: require")
         
+        # Create connection pool with SSL
+        connection_pool = psycopg2.pool.SimpleConnectionPool(
+            1,  # min connections
+            5,  # max connections (reduced for free tier)
+            dsn=database_url,
+            connect_timeout=10,
+            sslmode='require',
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=5
+        )
+        
+        # Test the connection
+        test_conn = connection_pool.getconn()
+        test_cursor = test_conn.cursor()
+        test_cursor.execute("SELECT 1")
+        test_cursor.close()
+        connection_pool.putconn(test_conn)
+        
+        print(f"✅ PostgreSQL connection pool created successfully")
         print(f"   Pool size: 1-5 connections")
+        print(f"   SSL Mode: require")
         return True
         
     except Exception as e:
@@ -62,37 +78,63 @@ def init_db_pool():
 init_db_pool()
 
 def get_db():
-    """Get a database connection from the pool"""
+    """Get a database connection from the pool with retry logic"""
     global connection_pool
     
-    # Retry logic for cold starts
+    # Retry logic for cold starts and SSL issues
     max_retries = 3
+    retry_delay = 2
+    
     for attempt in range(max_retries):
         try:
             if connection_pool is None:
-                print("⚠️ Connection pool not initialized, attempting to reinitialize...")
+                print(f"⚠️ Connection pool not initialized (attempt {attempt+1}/{max_retries})...")
                 if not init_db_pool():
                     if attempt == max_retries - 1:
                         raise Exception("Database connection pool not initialized after retries")
-                    time.sleep(2)
+                    time.sleep(retry_delay)
                     continue
             
+            # Try to get a connection
             connection = connection_pool.getconn()
+            
+            # Test the connection is alive
+            test_cursor = connection.cursor()
+            test_cursor.execute("SELECT 1")
+            test_cursor.close()
+            
             return connection
+            
+        except psycopg2.OperationalError as e:
+            if "SSL" in str(e):
+                print(f"⚠️ SSL error (attempt {attempt+1}/{max_retries}): {e}")
+                # Force reinitialize pool with fresh SSL connection
+                connection_pool = None
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+            else:
+                print(f"⚠️ Database connection error (attempt {attempt+1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    
         except Exception as e:
-            print(f"⚠️ Error getting database connection (attempt {attempt+1}/{max_retries}): {e}")
+            print(f"⚠️ Unexpected error (attempt {attempt+1}/{max_retries}): {e}")
             if attempt == max_retries - 1:
                 raise
-            time.sleep(2)
+            time.sleep(retry_delay)
     
-    raise Exception("Failed to get database connection")
+    raise Exception("Failed to get database connection after multiple retries")
 
 def return_db(connection):
     """Return a connection to the pool"""
     global connection_pool
     if connection_pool and connection:
         try:
-            connection_pool.putconn(connection)
+            # Ensure connection is still alive before returning
+            if not connection.closed:
+                connection_pool.putconn(connection)
+            else:
+                print("⚠️ Attempted to return closed connection to pool")
         except Exception as e:
             print(f"⚠️ Error returning connection to pool: {e}")
 
@@ -108,7 +150,10 @@ def get_db_cursor():
         connection.commit()
     except Exception as e:
         if connection:
-            connection.rollback()
+            try:
+                connection.rollback()
+            except:
+                pass
         raise e
     finally:
         if cursor:
@@ -357,19 +402,23 @@ def create_tables_if_not_exist():
             print("  ✅ indexes created")
             
             # Check if admin user exists, if not create default admin
-            cursor.execute("SELECT COUNT(*) FROM users WHERE user_type = 'admin'")
-            admin_count = cursor.fetchone()['count']
+            cursor.execute("SELECT COUNT(*) as count FROM users WHERE user_type = 'admin'")
+            result = cursor.fetchone()
+            admin_count = result['count'] if result else 0
             
             if admin_count == 0:
                 # Create default admin user
-                from auth import hash_password
-                admin_password = hash_password('Admin@123')
-                cursor.execute("""
-                    INSERT INTO users (username, email, password_hash, full_name, user_type, is_active, is_admin)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (username) DO NOTHING
-                """, ('admin', 'admin@agriaid.com', admin_password, 'System Administrator', 'admin', True, True))
-                print("  ✅ default admin user created (username: admin, password: Admin@123)")
+                try:
+                    from auth import hash_password
+                    admin_password = hash_password('Admin@123')
+                    cursor.execute("""
+                        INSERT INTO users (username, email, password_hash, full_name, user_type, is_active, is_admin)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (username) DO NOTHING
+                    """, ('admin', 'admin@agriaid.com', admin_password, 'System Administrator', 'admin', True, True))
+                    print("  ✅ default admin user created (username: admin, password: Admin@123)")
+                except Exception as e:
+                    print(f"  ⚠️ Could not create admin user: {e}")
             
             print("✅✅✅ ALL TABLES CREATED/VERIFIED SUCCESSFULLY! ✅✅✅")
             
@@ -379,11 +428,12 @@ def create_tables_if_not_exist():
         traceback.print_exc()
 
 # ========== AUTO-CREATE TABLES ON STARTUP ==========
-# This will run every time the app starts
 print("=" * 50)
 print("🚀 CHECKING DATABASE TABLES...")
 print("=" * 50)
 try:
+    # Small delay to ensure connection pool is ready
+    time.sleep(2)
     create_tables_if_not_exist()
 except Exception as e:
     print(f"⚠️ Could not create tables on startup: {e}")
