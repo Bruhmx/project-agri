@@ -1606,9 +1606,9 @@ def register_user_routes(app):
 
                 # Average confidence
                 cur.execute("""
-                    SELECT COALESCE(ROUND(AVG(confidence), 1), 0) as avg_confidence
-                    FROM diagnosis_history
-                """)
+    SELECT COALESCE(ROUND(AVG(confidence)::numeric, 1), 0) as avg_confidence
+    FROM diagnosis_history
+""")
                 avg_confidence = cur.fetchone()['avg_confidence'] or 0
 
                 # Top diseases detected
