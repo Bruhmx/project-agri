@@ -1,44 +1,56 @@
 # db_config.py
-import mysql.connector
-from mysql.connector import pooling
 import os
+import psycopg2
+from psycopg2 import pool
+from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
 from contextlib import contextmanager
+import time
 
 load_dotenv()
 
-# Initialize connection_pool as None first
+# Initialize connection pool as None first
 connection_pool = None
 
-
 def init_db_pool():
-    """Initialize the database connection pool"""
+    """Initialize the PostgreSQL connection pool"""
     global connection_pool
-
+    
     try:
-        # Create connection pool configuration - REDUCED POOL SIZE
-        db_config = {
-            "host": os.getenv("DB_HOST", "localhost"),
-            "user": os.getenv("DB_USER", "root"),
-            "password": os.getenv("DB_PASSWORD", ""),
-            "database": os.getenv("DB_NAME", "agriaid"),
-            "port": int(os.getenv("DB_PORT", 3306)),
-            "pool_name": "agriaid_pool",
-            "pool_size": 15,  # REDUCED FROM 30 TO 5
-            "pool_reset_session": True,
-            "autocommit": False,  # CHANGED TO False - better control
-            "use_pure": True,
-            "buffered": True,
-            "connection_timeout": 30,  # ADDED timeout
-        }
-
-        # Create connection pool
-        connection_pool = pooling.MySQLConnectionPool(**db_config)
-        print(f"✅ Database connection pool created successfully")
-        print(f"   Pool name: {db_config['pool_name']}")
-        print(f"   Pool size: {db_config['pool_size']}")
+        # Get database URL from environment (Render provides this)
+        database_url = os.getenv('DATABASE_URL')
+        
+        # Render provides DATABASE_URL, but it might start with postgres://
+        # psycopg2 requires postgresql://
+        if database_url and database_url.startswith('postgres://'):
+            database_url = database_url.replace('postgres://', 'postgresql://', 1)
+        
+        if database_url:
+            # Use the connection string directly
+            connection_pool = psycopg2.pool.SimpleConnectionPool(
+                1,  # min connections
+                5,  # max connections (reduced for free tier)
+                dsn=database_url
+            )
+            print(f"✅ PostgreSQL connection pool created using DATABASE_URL")
+        else:
+            # Fallback to individual parameters
+            db_config = {
+                "host": os.getenv("DB_HOST", "localhost"),
+                "user": os.getenv("DB_USER", "postgres"),
+                "password": os.getenv("DB_PASSWORD", ""),
+                "database": os.getenv("DB_NAME", "agriaid"),
+                "port": int(os.getenv("DB_PORT", 5432)),
+            }
+            
+            connection_pool = psycopg2.pool.SimpleConnectionPool(
+                1, 5, **db_config
+            )
+            print(f"✅ PostgreSQL connection pool created with parameters")
+        
+        print(f"   Pool size: 1-5 connections")
         return True
-
+        
     except Exception as e:
         print(f"❌ Failed to create connection pool: {e}")
         import traceback
@@ -46,111 +58,104 @@ def init_db_pool():
         connection_pool = None
         return False
 
-
 # Initialize the pool when module is imported
 init_db_pool()
-
 
 def get_db():
     """Get a database connection from the pool"""
     global connection_pool
+    
+    # Retry logic for cold starts
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            if connection_pool is None:
+                print("⚠️ Connection pool not initialized, attempting to reinitialize...")
+                if not init_db_pool():
+                    if attempt == max_retries - 1:
+                        raise Exception("Database connection pool not initialized after retries")
+                    time.sleep(2)
+                    continue
+            
+            connection = connection_pool.getconn()
+            return connection
+        except Exception as e:
+            print(f"⚠️ Error getting database connection (attempt {attempt+1}/{max_retries}): {e}")
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(2)
+    
+    raise Exception("Failed to get database connection")
 
-    if connection_pool is None:
-        # Try to reinitialize pool
-        print("⚠️ Connection pool not initialized, attempting to reinitialize...")
-        if not init_db_pool():
-            raise Exception("Database connection pool not initialized")
+def return_db(connection):
+    """Return a connection to the pool"""
+    global connection_pool
+    if connection_pool and connection:
+        try:
+            connection_pool.putconn(connection)
+        except Exception as e:
+            print(f"⚠️ Error returning connection to pool: {e}")
 
-    try:
-        connection = connection_pool.get_connection()
-        # REMOVED the print statement - too noisy
-        return connection
-    except Exception as e:
-        print(f"❌ Error getting database connection from pool: {e}")
-        # Try to reinitialize and get connection again
-        if init_db_pool():
-            return connection_pool.get_connection()
-        raise
-
-
-# ========== NEW: CONTEXT MANAGER ==========
 @contextmanager
 def get_db_cursor():
-    """Context manager for database connections - automatically closes"""
-    db = None
-    cur = None
+    """Context manager for database connections with commit"""
+    connection = None
+    cursor = None
     try:
-        db = get_db()
-        cur = db.cursor(dictionary=True)
-        yield cur
-        db.commit()
+        connection = get_db()
+        cursor = connection.cursor(cursor_factory=RealDictCursor)
+        yield cursor
+        connection.commit()
     except Exception as e:
-        if db:
-            db.rollback()
+        if connection:
+            connection.rollback()
         raise e
     finally:
-        # ALWAYS close cursor and connection
-        if cur:
+        if cursor:
             try:
-                cur.close()
+                cursor.close()
             except:
                 pass
-        if db:
+        if connection:
             try:
-                db.close()  # Returns connection to pool
+                return_db(connection)
             except:
                 pass
 
-
-# ========== NEW: SIMPLE CURSOR (without commit) ==========
 @contextmanager
 def get_db_cursor_readonly():
     """Context manager for read-only operations"""
-    db = None
-    cur = None
+    connection = None
+    cursor = None
     try:
-        db = get_db()
-        cur = db.cursor(dictionary_name=True)
-        yield cur
+        connection = get_db()
+        cursor = connection.cursor(cursor_factory=RealDictCursor)
+        yield cursor
     finally:
-        if cur:
+        if cursor:
             try:
-                cur.close()
+                cursor.close()
             except:
                 pass
-        if db:
+        if connection:
             try:
-                db.close()
+                return_db(connection)
             except:
                 pass
-
 
 def get_pool_info():
     """Get information about the connection pool"""
     global connection_pool
-
+    
     if connection_pool is None:
-        return {"status": "not_initialized", "pool": None}
-
+        return {"status": "not_initialized"}
+    
     try:
-        # Get available attributes safely
-        info = {
+        return {
             "status": "active",
-            "pool_name": getattr(connection_pool, 'pool_name', 'unknown'),
-            "pool_size": getattr(connection_pool, 'pool_size', 'unknown'),
+            "min_connections": connection_pool.minconn,
+            "max_connections": connection_pool.maxconn,
+            "closed": getattr(connection_pool, '_closed', False)
         }
-
-        # Try to get pool stats if available
-        try:
-            # This might work in some versions
-            if hasattr(connection_pool, '_cnx_queue'):
-                info["connections_in_use"] = len(connection_pool._cnx_queue)
-            if hasattr(connection_pool, '_cnx_avail'):
-                info["connections_available"] = len(connection_pool._cnx_avail)
-        except:
-            pass
-
-        return info
-
     except Exception as e:
         return {"status": "error", "error": str(e)}
