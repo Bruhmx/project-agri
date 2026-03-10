@@ -1565,222 +1565,222 @@ def register_user_routes(app):
 
     @app.route("/admin/dashboard")
     @admin_required
-        def admin_dashboard():
-            """Admin dashboard with comprehensive analytics"""
-    try:
-        with get_db_cursor_readonly() as cur:
-            # Get user statistics
-            cur.execute("""
-                SELECT 
-                    COUNT(*) as total_users,
-                    SUM(CASE WHEN is_active = TRUE THEN 1 ELSE 0 END) as active_users,
-                    SUM(CASE WHEN is_active = FALSE OR is_active IS NULL THEN 1 ELSE 0 END) as inactive_users,
-                    SUM(CASE WHEN user_type = 'farmer' THEN 1 ELSE 0 END) as total_farmers,
-                    SUM(CASE WHEN user_type = 'expert' THEN 1 ELSE 0 END) as total_experts,
-                    SUM(CASE WHEN user_type = 'researcher' THEN 1 ELSE 0 END) as total_researchers,
-                    SUM(CASE WHEN user_type = 'student' THEN 1 ELSE 0 END) as total_students,
-                    SUM(CASE WHEN user_type = 'admin' THEN 1 ELSE 0 END) as total_admins
-                FROM users
-            """)
-            user_stats = cur.fetchone()
-
-            # Active users today
-            cur.execute("""
-                SELECT COUNT(DISTINCT user_id) as active_today
-                FROM diagnosis_history
-                WHERE DATE(created_at) = CURRENT_DATE
-            """)
-            active_today = cur.fetchone()['active_today'] or 0
-
-            # ===== DIAGNOSIS STATISTICS =====
-            cur.execute("SELECT COUNT(*) as total FROM diagnosis_history")
-            total_diagnoses = cur.fetchone()['total'] or 0
-
-            cur.execute("""
-                SELECT COUNT(*) as monthly
-                FROM diagnosis_history
-                WHERE EXTRACT(MONTH FROM created_at) = EXTRACT(MONTH FROM CURRENT_DATE) 
-                AND EXTRACT(YEAR FROM created_at) = EXTRACT(YEAR FROM CURRENT_DATE)
-            """)
-            monthly_diagnoses = cur.fetchone()['monthly'] or 0
-
-            # Average confidence - FIXED for PostgreSQL
-            cur.execute("""
-                SELECT COALESCE(ROUND(AVG(confidence)::numeric, 1), 0) as avg_confidence
-                FROM diagnosis_history
-            """)
-            avg_confidence = float(cur.fetchone()['avg_confidence'] or 0)
-
-            # Top diseases detected - FIXED for PostgreSQL
-            cur.execute("""
-                SELECT 
-                    disease_detected,
-                    COUNT(*) as count,
-                    ROUND(AVG(confidence)::numeric, 1) as avg_confidence
-                FROM diagnosis_history
-                WHERE disease_detected != 'healthy' AND disease_detected IS NOT NULL
-                GROUP BY disease_detected
-                ORDER BY count DESC
-                LIMIT 5
-            """)
-            top_diseases = cur.fetchall()
-
-            # Diagnoses by crop
-            cur.execute("""
-                SELECT 
-                    crop,
-                    COUNT(*) as count
-                FROM diagnosis_history
-                WHERE crop IS NOT NULL
-                GROUP BY crop
-                ORDER BY count DESC
-            """)
-            diagnoses_by_crop = cur.fetchall()
-
-            # ===== DISEASE INFO STATISTICS =====
-            cur.execute("SELECT COUNT(*) as total_diseases FROM disease_info")
-            total_diseases = cur.fetchone()['total_diseases'] or 0
-
-            # Disease distribution by crop from disease_info
-            cur.execute("""
-                SELECT 
-                    crop,
-                    COUNT(*) as disease_count
-                FROM disease_info
-                GROUP BY crop
-                ORDER BY disease_count DESC
-            """)
-            disease_by_crop = cur.fetchall()
-
-            # ===== FEEDBACK STATISTICS =====
-            # Check if feedback table exists
-            cur.execute("""
-                SELECT EXISTS (
-                    SELECT FROM information_schema.tables 
-                    WHERE table_name = 'feedback'
-                ) as table_exists
-            """)
-            feedback_table_exists = cur.fetchone()['table_exists']
-
-            if feedback_table_exists:
+    def admin_dashboard():
+        """Admin dashboard with comprehensive analytics"""
+        try:
+            with get_db_cursor_readonly() as cur:
+                # Get user statistics
                 cur.execute("""
                     SELECT 
-                        COUNT(*) as total_feedback,
-                        SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending_feedback,
-                        SUM(CASE WHEN status = 'resolved' THEN 1 ELSE 0 END) as resolved_feedback
-                    FROM feedback
+                        COUNT(*) as total_users,
+                        SUM(CASE WHEN is_active = TRUE THEN 1 ELSE 0 END) as active_users,
+                        SUM(CASE WHEN is_active = FALSE OR is_active IS NULL THEN 1 ELSE 0 END) as inactive_users,
+                        SUM(CASE WHEN user_type = 'farmer' THEN 1 ELSE 0 END) as total_farmers,
+                        SUM(CASE WHEN user_type = 'expert' THEN 1 ELSE 0 END) as total_experts,
+                        SUM(CASE WHEN user_type = 'researcher' THEN 1 ELSE 0 END) as total_researchers,
+                        SUM(CASE WHEN user_type = 'student' THEN 1 ELSE 0 END) as total_students,
+                        SUM(CASE WHEN user_type = 'admin' THEN 1 ELSE 0 END) as total_admins
+                    FROM users
                 """)
-                feedback_stats = cur.fetchone()
-                if not feedback_stats:
+                user_stats = cur.fetchone()
+
+                # Active users today
+                cur.execute("""
+                    SELECT COUNT(DISTINCT user_id) as active_today
+                    FROM diagnosis_history
+                    WHERE DATE(created_at) = CURRENT_DATE
+                """)
+                active_today = cur.fetchone()['active_today'] or 0
+
+                # ===== DIAGNOSIS STATISTICS =====
+                cur.execute("SELECT COUNT(*) as total FROM diagnosis_history")
+                total_diagnoses = cur.fetchone()['total'] or 0
+
+                cur.execute("""
+                    SELECT COUNT(*) as monthly
+                    FROM diagnosis_history
+                    WHERE EXTRACT(MONTH FROM created_at) = EXTRACT(MONTH FROM CURRENT_DATE) 
+                    AND EXTRACT(YEAR FROM created_at) = EXTRACT(YEAR FROM CURRENT_DATE)
+                """)
+                monthly_diagnoses = cur.fetchone()['monthly'] or 0
+
+                # Average confidence - FIXED for PostgreSQL
+                cur.execute("""
+                    SELECT COALESCE(ROUND(AVG(confidence)::numeric, 1), 0) as avg_confidence
+                    FROM diagnosis_history
+                """)
+                avg_confidence = float(cur.fetchone()['avg_confidence'] or 0)
+
+                # Top diseases detected - FIXED for PostgreSQL
+                cur.execute("""
+                    SELECT 
+                        disease_detected,
+                        COUNT(*) as count,
+                        ROUND(AVG(confidence)::numeric, 1) as avg_confidence
+                    FROM diagnosis_history
+                    WHERE disease_detected != 'healthy' AND disease_detected IS NOT NULL
+                    GROUP BY disease_detected
+                    ORDER BY count DESC
+                    LIMIT 5
+                """)
+                top_diseases = cur.fetchall()
+
+                # Diagnoses by crop
+                cur.execute("""
+                    SELECT 
+                        crop,
+                        COUNT(*) as count
+                    FROM diagnosis_history
+                    WHERE crop IS NOT NULL
+                    GROUP BY crop
+                    ORDER BY count DESC
+                """)
+                diagnoses_by_crop = cur.fetchall()
+
+                # ===== DISEASE INFO STATISTICS =====
+                cur.execute("SELECT COUNT(*) as total_diseases FROM disease_info")
+                total_diseases = cur.fetchone()['total_diseases'] or 0
+
+                # Disease distribution by crop from disease_info
+                cur.execute("""
+                    SELECT 
+                        crop,
+                        COUNT(*) as disease_count
+                    FROM disease_info
+                    GROUP BY crop
+                    ORDER BY disease_count DESC
+                """)
+                disease_by_crop = cur.fetchall()
+
+                # ===== FEEDBACK STATISTICS =====
+                # Check if feedback table exists
+                cur.execute("""
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables 
+                        WHERE table_name = 'feedback'
+                    ) as table_exists
+                """)
+                feedback_table_exists = cur.fetchone()['table_exists']
+
+                if feedback_table_exists:
+                    cur.execute("""
+                        SELECT 
+                            COUNT(*) as total_feedback,
+                            SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending_feedback,
+                            SUM(CASE WHEN status = 'resolved' THEN 1 ELSE 0 END) as resolved_feedback
+                        FROM feedback
+                    """)
+                    feedback_stats = cur.fetchone()
+                    if not feedback_stats:
+                        feedback_stats = {'total_feedback': 0, 'pending_feedback': 0, 'resolved_feedback': 0}
+                else:
                     feedback_stats = {'total_feedback': 0, 'pending_feedback': 0, 'resolved_feedback': 0}
-            else:
-                feedback_stats = {'total_feedback': 0, 'pending_feedback': 0, 'resolved_feedback': 0}
 
-            # ===== ACCURACY STATS (FIXED: Added this missing variable) =====
-            accuracy_stats = {
-                'accuracy_rate': avg_confidence,
-                'total_verified': total_diagnoses,
-                'accurate_detections': int(total_diagnoses * (avg_confidence / 100)) if avg_confidence > 0 else 0
-            }
+                # ===== ACCURACY STATS =====
+                accuracy_stats = {
+                    'accuracy_rate': avg_confidence,
+                    'total_verified': total_diagnoses,
+                    'accurate_detections': int(total_diagnoses * (avg_confidence / 100)) if avg_confidence > 0 else 0
+                }
 
-            # ===== CONFIDENCE STATS =====
-            confidence_stats = {
-                'avg_confidence': avg_confidence
-            }
+                # ===== CONFIDENCE STATS =====
+                confidence_stats = {
+                    'avg_confidence': avg_confidence
+                }
 
-            # ===== RECENT ACTIVITIES =====
-            cur.execute("""
-                SELECT 
-                    dh.created_at,
-                    u.username,
-                    CONCAT('Diagnosed ', dh.disease_detected, ' on ', dh.crop) as action,
-                    u.id as user_id
-                FROM diagnosis_history dh
-                JOIN users u ON dh.user_id = u.id
-                ORDER BY dh.created_at DESC
-                LIMIT 10
-            """)
-            recent_activities = cur.fetchall()
+                # ===== RECENT ACTIVITIES =====
+                cur.execute("""
+                    SELECT 
+                        dh.created_at,
+                        u.username,
+                        CONCAT('Diagnosed ', dh.disease_detected, ' on ', dh.crop) as action,
+                        u.id as user_id
+                    FROM diagnosis_history dh
+                    JOIN users u ON dh.user_id = u.id
+                    ORDER BY dh.created_at DESC
+                    LIMIT 10
+                """)
+                recent_activities = cur.fetchall()
 
-            # ===== ADD AVATAR COLORS =====
-            avatar_colors = [
-                '#0d6efd', '#198754', '#dc3545', '#ffc107', '#0dcaf0',
-                '#6610f2', '#6f42c1', '#d63384', '#fd7e14', '#20c997'
-            ]
+                # ===== ADD AVATAR COLORS =====
+                avatar_colors = [
+                    '#0d6efd', '#198754', '#dc3545', '#ffc107', '#0dcaf0',
+                    '#6610f2', '#6f42c1', '#d63384', '#fd7e14', '#20c997'
+                ]
 
-            # Add colors to recent_activities
-            for i, activity in enumerate(recent_activities):
-                activity['avatar_color'] = avatar_colors[i % len(avatar_colors)]
+                # Add colors to recent_activities
+                for i, activity in enumerate(recent_activities):
+                    activity['avatar_color'] = avatar_colors[i % len(avatar_colors)]
 
-            # ===== SIDEBAR STATS =====
-            # Get pending users count (inactive users)
-            cur.execute("SELECT COUNT(*) as count FROM users WHERE is_active = FALSE")
-            pending_users = cur.fetchone()['count'] or 0
+                # ===== SIDEBAR STATS =====
+                # Get pending users count (inactive users)
+                cur.execute("SELECT COUNT(*) as count FROM users WHERE is_active = FALSE")
+                pending_users = cur.fetchone()['count'] or 0
 
-            sidebar_stats = {
-                'pending_users': pending_users,
-                'pending_feedback': feedback_stats['pending_feedback'] or 0
-            }
+                sidebar_stats = {
+                    'pending_users': pending_users,
+                    'pending_feedback': feedback_stats['pending_feedback'] or 0
+                }
 
-            # ===== SYSTEM HEALTH SCORE =====
-            health_score = 0.0
-            health_factors = []
+                # ===== SYSTEM HEALTH SCORE =====
+                health_score = 0.0
+                health_factors = []
 
-            # Factor 1: User engagement (30%)
-            if user_stats['total_users'] > 0:
-                engagement_rate = (active_today / user_stats['total_users']) * 100
-                engagement_score = min(30.0, (engagement_rate / 10) * 3)
-                health_factors.append({'factor': 'User Engagement', 'score': round(engagement_score, 1), 'max': 30})
-                health_score += engagement_score
+                # Factor 1: User engagement (30%)
+                if user_stats['total_users'] > 0:
+                    engagement_rate = (active_today / user_stats['total_users']) * 100
+                    engagement_score = min(30.0, (engagement_rate / 10) * 3)
+                    health_factors.append({'factor': 'User Engagement', 'score': round(engagement_score, 1), 'max': 30})
+                    health_score += engagement_score
 
-            # Factor 2: Diagnosis activity (30%)
-            if total_diagnoses > 0:
-                activity_score = min(30.0, (total_diagnoses / 50) * 15)
-                health_factors.append({'factor': 'Diagnosis Activity', 'score': round(activity_score, 1), 'max': 30})
-                health_score += activity_score
+                # Factor 2: Diagnosis activity (30%)
+                if total_diagnoses > 0:
+                    activity_score = min(30.0, (total_diagnoses / 50) * 15)
+                    health_factors.append({'factor': 'Diagnosis Activity', 'score': round(activity_score, 1), 'max': 30})
+                    health_score += activity_score
 
-            # Factor 3: Disease coverage (20%)
-            if total_diseases > 0:
-                coverage_score = min(20.0, total_diseases * 2)
-                health_factors.append({'factor': 'Disease Coverage', 'score': round(coverage_score, 1), 'max': 20})
-                health_score += coverage_score
+                # Factor 3: Disease coverage (20%)
+                if total_diseases > 0:
+                    coverage_score = min(20.0, total_diseases * 2)
+                    health_factors.append({'factor': 'Disease Coverage', 'score': round(coverage_score, 1), 'max': 20})
+                    health_score += coverage_score
 
-            # Factor 4: Feedback response (20%)
-            if feedback_stats['total_feedback'] > 0:
-                resolution_rate = (feedback_stats['resolved_feedback'] / feedback_stats['total_feedback']) * 100
-                feedback_score = min(20.0, (resolution_rate / 100) * 20)
-                health_factors.append(
-                    {'factor': 'Feedback Resolution', 'score': round(feedback_score, 1), 'max': 20})
-                health_score += feedback_score
+                # Factor 4: Feedback response (20%)
+                if feedback_stats['total_feedback'] > 0:
+                    resolution_rate = (feedback_stats['resolved_feedback'] / feedback_stats['total_feedback']) * 100
+                    feedback_score = min(20.0, (resolution_rate / 100) * 20)
+                    health_factors.append(
+                        {'factor': 'Feedback Resolution', 'score': round(feedback_score, 1), 'max': 20})
+                    health_score += feedback_score
 
-            health_score = round(health_score, 1)
+                health_score = round(health_score, 1)
 
-        return render_template("admin/dashboard.html",
-                               user_stats=user_stats,
-                               active_today=active_today,
-                               avg_confidence=avg_confidence,
-                               confidence_stats=confidence_stats,
-                               accuracy_stats=accuracy_stats,
-                               total_diagnoses=total_diagnoses,
-                               monthly_diagnoses=monthly_diagnoses,
-                               total_diseases=total_diseases,
-                               disease_by_crop=disease_by_crop,
-                               diagnoses_by_crop=diagnoses_by_crop,
-                               top_diseases=top_diseases,
-                               feedback_stats=feedback_stats,
-                               health_score=health_score,
-                               health_factors=health_factors,
-                               recent_activities=recent_activities,
-                               avatar_colors=avatar_colors,
-                               stats=sidebar_stats,
-                               now=datetime.now())
+            return render_template("admin/dashboard.html",
+                                   user_stats=user_stats,
+                                   active_today=active_today,
+                                   avg_confidence=avg_confidence,
+                                   confidence_stats=confidence_stats,
+                                   accuracy_stats=accuracy_stats,
+                                   total_diagnoses=total_diagnoses,
+                                   monthly_diagnoses=monthly_diagnoses,
+                                   total_diseases=total_diseases,
+                                   disease_by_crop=disease_by_crop,
+                                   diagnoses_by_crop=diagnoses_by_crop,
+                                   top_diseases=top_diseases,
+                                   feedback_stats=feedback_stats,
+                                   health_score=health_score,
+                                   health_factors=health_factors,
+                                   recent_activities=recent_activities,
+                                   avatar_colors=avatar_colors,
+                                   stats=sidebar_stats,
+                                   now=datetime.now())
 
-    except Exception as e:
-        print(f"Admin dashboard error: {e}")
-        import traceback
-        traceback.print_exc()
-        flash('Error loading admin dashboard', 'danger')
-        return redirect(url_for('dashboard'))
+        except Exception as e:
+            print(f"Admin dashboard error: {e}")
+            import traceback
+            traceback.print_exc()
+            flash('Error loading admin dashboard', 'danger')
+            return redirect(url_for('dashboard'))
 
     # ========== ADMIN USER MANAGEMENT ==========
     @app.route("/admin/users")
@@ -2410,7 +2410,7 @@ def register_user_routes(app):
         new_password = form_data.get('new_password')
         confirm_password = form_data.get('confirm_password')
 
-        with get_db_cursor_readonly() as cur:
+        with get_db_cursor() as cur:
             # Update email
             cur.execute("UPDATE users SET email = %s WHERE id = %s", (email, user_id))
 
@@ -2420,12 +2420,10 @@ def register_user_routes(app):
                 cur.execute("SELECT password_hash FROM users WHERE id = %s", (user_id,))
                 user = cur.fetchone()
 
-                from auth import check_password_hash
-                if user and check_password_hash(user['password_hash'], current_password):
+                if user and check_password(current_password, user['password_hash']):
                     if new_password == confirm_password:
-                        from auth import generate_password_hash
-                        hashed_password = generate_password_hash(new_password)
-                        cur.execute("UPDATE users SET password_hash = %s WHERE id = %s", (hashed_password, user_id))
+                        new_hash = hash_password(new_password)
+                        cur.execute("UPDATE users SET password_hash = %s WHERE id = %s", (new_hash, user_id))
                         flash('Password updated successfully!', 'success')
                     else:
                         flash('New passwords do not match!', 'danger')
