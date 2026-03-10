@@ -1563,10 +1563,10 @@ def register_user_routes(app):
 
     # ========== ADMIN DASHBOARD ==========
 
-@app.route("/admin/dashboard")
-@admin_required
-def admin_dashboard():
-    """Admin dashboard with comprehensive analytics"""
+    @app.route("/admin/dashboard")
+    @admin_required
+        def admin_dashboard():
+            """Admin dashboard with comprehensive analytics"""
     try:
         with get_db_cursor_readonly() as cur:
             # Get user statistics
@@ -1759,8 +1759,8 @@ def admin_dashboard():
                                user_stats=user_stats,
                                active_today=active_today,
                                avg_confidence=avg_confidence,
-                               confidence_stats=confidence_stats,  # Added
-                               accuracy_stats=accuracy_stats,      # Added (this was missing)
+                               confidence_stats=confidence_stats,
+                               accuracy_stats=accuracy_stats,
                                total_diagnoses=total_diagnoses,
                                monthly_diagnoses=monthly_diagnoses,
                                total_diseases=total_diseases,
