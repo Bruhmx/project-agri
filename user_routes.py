@@ -1671,7 +1671,14 @@ def register_user_routes(app):
                         FROM feedback
                     """)
                     feedback_stats = cur.fetchone()
-                    if not feedback_stats:
+                    # FIXED: Ensure all values are numbers (not None)
+                    if feedback_stats:
+                        feedback_stats = {
+                            'total_feedback': feedback_stats['total_feedback'] or 0,
+                            'pending_feedback': feedback_stats['pending_feedback'] or 0,
+                            'resolved_feedback': feedback_stats['resolved_feedback'] or 0
+                        }
+                    else:
                         feedback_stats = {'total_feedback': 0, 'pending_feedback': 0, 'resolved_feedback': 0}
                 else:
                     feedback_stats = {'total_feedback': 0, 'pending_feedback': 0, 'resolved_feedback': 0}
@@ -3588,7 +3595,7 @@ def register_user_routes(app):
                         pass
 
             # Save new image
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             filename = secure_filename(f"{user_id}_{timestamp}_{file.filename}")
 
             upload_folder = os.path.join(app.config['UPLOAD_FOLDER'], 'profiles')
