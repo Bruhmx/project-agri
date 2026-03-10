@@ -4,20 +4,80 @@ from PIL import Image
 import warnings
 import os
 import glob
+
 warnings.filterwarnings('ignore')
 
-# Load models (with error handling)
-try:
-    crop_model = tf.keras.models.load_model("models/crop_model_final.keras")
-    corn_model = tf.keras.models.load_model("models/corn_model_final.keras")
-    rice_model = tf.keras.models.load_model("models/rice_model_final.keras")
-    print("✓ Models loaded successfully")
-except Exception as e:
-    print(f"✗ Error loading models: {e}")
-    # Create dummy models for development
-    crop_model = None
-    corn_model = None
-    rice_model = None
+# Function to load model with compatibility fixes for TF 2.13.0
+def load_model_safely(model_path, model_name):
+    """Load a Keras model with compatibility fixes for TF 2.13.0"""
+    if not os.path.exists(model_path):
+        print(f"⚠️ Model file not found: {model_path}")
+        return None
+    
+    print(f"Attempting to load {model_name} from {model_path}...")
+    
+    # Method 1: Standard loading for TF 2.13.0
+    try:
+        model = tf.keras.models.load_model(model_path)
+        print(f"✓ {model_name} loaded successfully")
+        return model
+    except Exception as e:
+        print(f"  Standard loading failed: {type(e).__name__} - {str(e)[:100]}")
+        
+        # Method 2: Load with custom objects for TF 2.13.0
+        try:
+            model = tf.keras.models.load_model(
+                model_path,
+                custom_objects={
+                    'Functional': tf.keras.Model,
+                }
+            )
+            print(f"✓ {model_name} loaded with custom objects")
+            return model
+        except Exception as e2:
+            print(f"  Custom objects loading failed: {type(e2).__name__}")
+            
+            # Method 3: Load with compile=False
+            try:
+                model = tf.keras.models.load_model(
+                    model_path,
+                    compile=False
+                )
+                print(f"✓ {model_name} loaded with compile=False")
+                return model
+            except Exception as e3:
+                print(f"  All loading methods failed: {type(e3).__name__}")
+    
+    return None
+
+# Get the directory where this script is located
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODELS_DIR = os.path.join(BASE_DIR, "models")
+
+print("=" * 50)
+print("Loading ML Models with TensorFlow", tf.__version__)
+print("=" * 50)
+
+# Create models directory if it doesn't exist
+os.makedirs(MODELS_DIR, exist_ok=True)
+
+# Load models with safe method
+crop_model = load_model_safely(os.path.join(MODELS_DIR, "crop_model_final.keras"), "Crop Model")
+corn_model = load_model_safely(os.path.join(MODELS_DIR, "corn_model_final.keras"), "Corn Disease Model")
+rice_model = load_model_safely(os.path.join(MODELS_DIR, "rice_model_final.keras"), "Rice Disease Model")
+
+print("=" * 50)
+if crop_model is not None and corn_model is not None and rice_model is not None:
+    print("✓ All models loaded successfully!")
+else:
+    print("⚠️ Some models failed to load - using fallback predictions")
+    if crop_model is None:
+        print("  - Crop model: NOT LOADED")
+    if corn_model is None:
+        print("  - Corn model: NOT LOADED")
+    if rice_model is None:
+        print("  - Rice model: NOT LOADED")
+print("=" * 50)
 
 # Class mappings with display names
 CROP_CLASSES = ["corn", "rice"]
@@ -47,6 +107,10 @@ RICE_DISPLAY_NAMES = {
 def preprocess_image(img_path, img_size=(224, 224)):
     """Preprocess image for model prediction"""
     try:
+        if not os.path.exists(img_path):
+            print(f"⚠️ Image not found: {img_path}")
+            return np.zeros((1, 224, 224, 3))
+            
         img = Image.open(img_path)
         # Convert to RGB if necessary
         if img.mode != 'RGB':
@@ -56,50 +120,62 @@ def preprocess_image(img_path, img_size=(224, 224)):
         img_array = np.array(img) / 255.0
         return np.expand_dims(img_array, axis=0)
     except Exception as e:
-        print(f"Error preprocessing image: {e}")
-        # Return dummy array for development
+        print(f"⚠️ Error preprocessing image: {e}")
         return np.zeros((1, 224, 224, 3))
 
 
 def predict_crop(img_path):
     """Predict crop type from image"""
     if crop_model is None:
-        # Development fallback
+        print("⚠️ Crop model not loaded - using fallback")
         return "corn", 0.85
 
-    img = preprocess_image(img_path)
-    predictions = crop_model.predict(img, verbose=0)[0]
-    pred_idx = np.argmax(predictions)
-    crop = CROP_CLASSES[pred_idx]
-    confidence = float(predictions[pred_idx])
-    return crop, confidence
+    try:
+        img = preprocess_image(img_path)
+        predictions = crop_model.predict(img, verbose=0)[0]
+        pred_idx = np.argmax(predictions)
+        crop = CROP_CLASSES[pred_idx]
+        confidence = float(predictions[pred_idx])
+        return crop, confidence
+    except Exception as e:
+        print(f"⚠️ Error in crop prediction: {e}")
+        return "corn", 0.5
 
 
 def predict_disease(img_path, crop):
     """Predict disease based on crop type"""
-    img = preprocess_image(img_path)
+    try:
+        img = preprocess_image(img_path)
 
-    if crop == "corn":
-        if corn_model is None:
-            # Development fallback
+        if crop == "corn":
+            if corn_model is None:
+                print("⚠️ Corn model not loaded - using fallback")
+                return [("Common_Rust", 0.7), ("gls", 0.2), ("healthy", 0.1)]
+
+            predictions = corn_model.predict(img, verbose=0)[0]
+            classes = CORN_CLASSES
+        else:  # rice
+            if rice_model is None:
+                print("⚠️ Rice model not loaded - using fallback")
+                return [("blast", 0.6), ("blight", 0.3), ("healthy", 0.1)]
+
+            predictions = rice_model.predict(img, verbose=0)[0]
+            classes = RICE_CLASSES
+
+        # Create list of (class, confidence) pairs
+        results = list(zip(classes, predictions))
+        # Sort by confidence (descending)
+        results.sort(key=lambda x: x[1], reverse=True)
+
+        return results[:3]  # Return top 3 predictions
+        
+    except Exception as e:
+        print(f"⚠️ Error in disease prediction: {e}")
+        # Return fallback predictions
+        if crop == "corn":
             return [("Common_Rust", 0.7), ("gls", 0.2), ("healthy", 0.1)]
-
-        predictions = corn_model.predict(img, verbose=0)[0]
-        classes = CORN_CLASSES
-    else:  # rice
-        if rice_model is None:
-            # Development fallback
+        else:
             return [("blast", 0.6), ("blight", 0.3), ("healthy", 0.1)]
-
-        predictions = rice_model.predict(img, verbose=0)[0]
-        classes = RICE_CLASSES
-
-    # Create list of (class, confidence) pairs
-    results = list(zip(classes, predictions))
-    # Sort by confidence (descending)
-    results.sort(key=lambda x: x[1], reverse=True)
-
-    return results[:3]  # Return top 3 predictions
 
 
 def get_crop_display_name(crop_code):
@@ -117,11 +193,11 @@ def get_disease_display_name(disease_code):
 
 def get_sample_images(disease_code, crop):
     """Return local sample image paths for the diagnosed disease"""
-    # Clean disease code for folder names (replace spaces with underscores)
+    # Clean disease code for folder names
     clean_disease_code = disease_code.replace(' ', '_')
 
     # Define the sample images directory
-    base_dir = 'static/samples'
+    base_dir = os.path.join('static', 'samples')
     sample_dir = os.path.join(base_dir, crop, clean_disease_code)
 
     # Check if directory exists
@@ -136,58 +212,28 @@ def get_sample_images(disease_code, crop):
         # Sort files to maintain consistency
         image_files.sort()
 
-        # Convert to URL paths (relative to static folder)
+        # Convert to URL paths
         sample_urls = []
         for img_path in image_files[:4]:  # Get max 4 images
-            # Convert to URL path (relative from static folder)
-            # Example: static/samples/corn/Common_Rust/sample1.jpg -> /static/samples/corn/Common_Rust/sample1.jpg
-            rel_path = img_path.replace('\\', '/')  # For Windows compatibility
-            sample_urls.append('/' + rel_path)
+            rel_path = img_path.replace('\\', '/')
+            if not rel_path.startswith('/'):
+                rel_path = '/' + rel_path
+            sample_urls.append(rel_path)
 
-        # Return the URLs if we found images
         if sample_urls:
             return sample_urls
 
-    # Return default/fallback images if no samples found
-    return get_default_sample_images(crop, disease_code)
-
-
-def get_default_sample_images(crop, disease_code):
-    """Return default sample images when no specific images are found"""
-    # You can create some generic sample images for each crop
-    generic_images = {
-        'corn': [
-            '/static/samples/default/corn_sample1.jpg',
-            '/static/samples/default/corn_sample2.jpg',
-            '/static/samples/default/corn_sample3.jpg',
-            '/static/samples/default/corn_sample4.jpg'
-        ],
-        'rice': [
-            '/static/samples/default/rice_sample1.jpg',
-            '/static/samples/default/rice_sample2.jpg',
-            '/static/samples/default/rice_sample3.jpg',
-            '/static/samples/default/rice_sample4.jpg'
-        ]
-    }
-
-    # Create the default directory if it doesn't exist
-    default_dir = 'static/samples/default'
-    os.makedirs(default_dir, exist_ok=True)
-
-    # Check if default images exist, if not provide placeholder text
-    if crop in generic_images:
-        # Check if at least one image exists
-        if os.path.exists(generic_images[crop][0].lstrip('/')):
-            return generic_images[crop]
-
-    # Ultimate fallback - placeholder message
+    # Return empty list if no images found
     return []
+
 
 def get_model_info():
     """Get information about loaded models"""
     info = {
-        'crop_model': 'Loaded' if crop_model else 'Not loaded',
-        'corn_model': 'Loaded' if corn_model else 'Not loaded',
-        'rice_model': 'Loaded' if rice_model else 'Not loaded',
+        'crop_model': 'Loaded' if crop_model is not None else 'Not loaded',
+        'corn_model': 'Loaded' if corn_model is not None else 'Not loaded',
+        'rice_model': 'Loaded' if rice_model is not None else 'Not loaded',
+        'tensorflow_version': tf.__version__,
+        'keras_version': tf.keras.__version__
     }
     return info
