@@ -305,12 +305,12 @@ def register_user_routes(app):
 
         try:
             with get_db_cursor_readonly() as cur:
-                # Get user stats
+                # Get user stats - FIXED for PostgreSQL
                 cur.execute("""
                     SELECT 
                         COUNT(*) as total_diagnoses,
                         COUNT(CASE WHEN DATE(created_at) = CURRENT_DATE THEN 1 END) as today_diagnoses,
-                        AVG(confidence) as avg_confidence
+                        ROUND(AVG(confidence)::numeric, 1) as avg_confidence
                     FROM diagnosis_history 
                     WHERE user_id = %s
                 """, (user_id,))
@@ -319,7 +319,7 @@ def register_user_routes(app):
                 if not stats:
                     stats = {'total_diagnoses': 0, 'today_diagnoses': 0, 'avg_confidence': 0}
                 else:
-                    stats['avg_confidence'] = round(stats['avg_confidence'] or 0, 1)
+                    stats['avg_confidence'] = float(stats['avg_confidence'] or 0)
 
                 # Get saved count
                 try:
@@ -436,15 +436,15 @@ def register_user_routes(app):
                 """, (user_id,))
                 crop_expertise = cur.fetchall()
 
-                # Get common diseases
+                # Get common diseases - FIXED for PostgreSQL
                 cur.execute("""
                     SELECT 
                         disease_detected as name,
                         crop,
                         COUNT(*) as count,
                         MAX(created_at) as last_detected,
-                        ROUND(AVG(confidence), 1) as avg_confidence,
-                        ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER(), 1) as percentage
+                        ROUND(AVG(confidence)::numeric, 1) as avg_confidence,
+                        ROUND((COUNT(*) * 100.0 / SUM(COUNT(*)) OVER())::numeric, 1) as percentage
                     FROM diagnosis_history 
                     WHERE user_id = %s
                     GROUP BY disease_detected, crop
@@ -651,59 +651,59 @@ def register_user_routes(app):
             diseases = request.args.get('diseases', '').split(',') if request.args.get('diseases') else []
             saved_only = request.args.get('saved_only') == 'true'
 
-            # --- BUILD MAIN QUERY WITH FILTERS ---
-            query = """
-                SELECT dh.id, dh.crop, dh.disease_detected, dh.confidence, 
-                       dh.symptoms, dh.recommendations, dh.created_at,
-                       dh.image_path,
-                       (SELECT COUNT(*) FROM saved_diagnoses WHERE id = dh.id AND user_id = %s) > 0 as saved
-                FROM diagnosis_history dh
-                WHERE dh.user_id = %s
-            """
-            params = [user_id, user_id]
-            count_params = [user_id]
-
-            # ADD DATE FILTERS
-            if date_from:
-                query += " AND DATE(dh.created_at) >= %s"
-                params.append(date_from)
-                count_params.append(date_from)
-            if date_to:
-                query += " AND DATE(dh.created_at) <= %s"
-                params.append(date_to)
-                count_params.append(date_to)
-
-            # ADD CROP FILTERS
-            if crops and crops[0] != '':
-                placeholders = ', '.join(['%s'] * len(crops))
-                query += f" AND dh.crop IN ({placeholders})"
-                params.extend(crops)
-                count_params.extend(crops)
-
-            # ADD DISEASE FILTERS
-            if diseases and diseases[0] != '':
-                placeholders = ', '.join(['%s'] * len(diseases))
-                query += f" AND dh.disease_detected IN ({placeholders})"
-                params.extend(diseases)
-                count_params.extend(diseases)
-
-            # ADD SAVED ONLY FILTER
-            if saved_only:
-                query += """
-                    AND EXISTS (
-                        SELECT 1 FROM saved_diagnoses 
-                        WHERE id = dh.id AND user_id = %s
-                    )
-                """
-                params.append(user_id)
-                count_params.append(user_id)
-
-            # ADD ORDER BY AND PAGINATION
-            query += " ORDER BY dh.created_at DESC LIMIT %s OFFSET %s"
-            params.extend([per_page, offset])
-
-            # EXECUTE QUERY
             with get_db_cursor_readonly() as cur:
+                # --- BUILD MAIN QUERY WITH FILTERS ---
+                query = """
+                    SELECT dh.id, dh.crop, dh.disease_detected, dh.confidence, 
+                           dh.symptoms, dh.recommendations, dh.created_at,
+                           dh.image_path,
+                           (SELECT COUNT(*) FROM saved_diagnoses WHERE id = dh.id AND user_id = %s) > 0 as saved
+                    FROM diagnosis_history dh
+                    WHERE dh.user_id = %s
+                """
+                params = [user_id, user_id]
+                count_params = [user_id]
+
+                # ADD DATE FILTERS
+                if date_from:
+                    query += " AND DATE(dh.created_at) >= %s"
+                    params.append(date_from)
+                    count_params.append(date_from)
+                if date_to:
+                    query += " AND DATE(dh.created_at) <= %s"
+                    params.append(date_to)
+                    count_params.append(date_to)
+
+                # ADD CROP FILTERS
+                if crops and crops[0] != '':
+                    placeholders = ', '.join(['%s'] * len(crops))
+                    query += f" AND dh.crop IN ({placeholders})"
+                    params.extend(crops)
+                    count_params.extend(crops)
+
+                # ADD DISEASE FILTERS
+                if diseases and diseases[0] != '':
+                    placeholders = ', '.join(['%s'] * len(diseases))
+                    query += f" AND dh.disease_detected IN ({placeholders})"
+                    params.extend(diseases)
+                    count_params.extend(diseases)
+
+                # ADD SAVED ONLY FILTER
+                if saved_only:
+                    query += """
+                        AND EXISTS (
+                            SELECT 1 FROM saved_diagnoses 
+                            WHERE id = dh.id AND user_id = %s
+                        )
+                    """
+                    params.append(user_id)
+                    count_params.append(user_id)
+
+                # ADD ORDER BY AND PAGINATION
+                query += " ORDER BY dh.created_at DESC LIMIT %s OFFSET %s"
+                params.extend([per_page, offset])
+
+                # EXECUTE QUERY
                 cur.execute(query, params)
                 diagnoses = cur.fetchall()
 
@@ -764,9 +764,9 @@ def register_user_routes(app):
                 cur.execute(monthly_query, monthly_params)
                 monthly_diagnoses = cur.fetchone()['monthly_diagnoses'] or 0
 
-                # Average confidence
+                # Average confidence - FIXED for PostgreSQL
                 avg_conf_query = """
-                    SELECT COALESCE(AVG(confidence), 0) as avg_confidence
+                    SELECT COALESCE(ROUND(AVG(confidence)::numeric, 1), 0) as avg_confidence
                     FROM diagnosis_history dh
                     WHERE dh.user_id = %s
                 """
@@ -788,7 +788,7 @@ def register_user_routes(app):
                     avg_conf_params.extend(diseases)
 
                 cur.execute(avg_conf_query, avg_conf_params)
-                avg_confidence = round(cur.fetchone()['avg_confidence'] or 0, 1)
+                avg_confidence = float(cur.fetchone()['avg_confidence'] or 0)
 
                 # Saved count
                 cur.execute("""
@@ -1604,19 +1604,19 @@ def register_user_routes(app):
                 """)
                 monthly_diagnoses = cur.fetchone()['monthly'] or 0
 
-                # Average confidence
+                # Average confidence - FIXED for PostgreSQL
                 cur.execute("""
-    SELECT COALESCE(ROUND(AVG(confidence)::numeric, 1), 0) as avg_confidence
-    FROM diagnosis_history
-""")
-                avg_confidence = cur.fetchone()['avg_confidence'] or 0
+                    SELECT COALESCE(ROUND(AVG(confidence)::numeric, 1), 0) as avg_confidence
+                    FROM diagnosis_history
+                """)
+                avg_confidence = float(cur.fetchone()['avg_confidence'] or 0)
 
-                # Top diseases detected
+                # Top diseases detected - FIXED for PostgreSQL
                 cur.execute("""
                     SELECT 
                         disease_detected,
                         COUNT(*) as count,
-                        ROUND(AVG(confidence), 1) as avg_confidence
+                        ROUND(AVG(confidence)::numeric, 1) as avg_confidence
                     FROM diagnosis_history
                     WHERE disease_detected != 'healthy' AND disease_detected IS NOT NULL
                     GROUP BY disease_detected
@@ -2651,12 +2651,12 @@ def register_user_routes(app):
                 """, (start_date,))
                 daily_diagnoses = cur.fetchall()
 
-                # ===== DIAGNOSES BY CROP =====
+                # ===== DIAGNOSES BY CROP ===== - FIXED for PostgreSQL
                 cur.execute("""
                     SELECT 
                         crop,
                         COUNT(*) as count,
-                        ROUND(AVG(confidence), 1) as avg_confidence
+                        ROUND(AVG(confidence)::numeric, 1) as avg_confidence
                     FROM diagnosis_history
                     WHERE crop IS NOT NULL AND created_at >= %s
                     GROUP BY crop
@@ -2665,12 +2665,12 @@ def register_user_routes(app):
                 """, (start_date,))
                 top_crops = cur.fetchall()
 
-                # ===== TOP DISEASES =====
+                # ===== TOP DISEASES ===== - FIXED for PostgreSQL
                 cur.execute("""
                     SELECT 
                         disease_detected,
                         COUNT(*) as count,
-                        ROUND(AVG(confidence), 1) as avg_confidence
+                        ROUND(AVG(confidence)::numeric, 1) as avg_confidence
                     FROM diagnosis_history
                     WHERE disease_detected != 'Healthy Plant' 
                       AND disease_detected IS NOT NULL
@@ -2936,7 +2936,7 @@ def register_user_routes(app):
                         SUM(CASE WHEN expert_review_status = 'needs correction' THEN 1 ELSE 0 END) as needs_correction,
                         SUM(CASE WHEN expert_review_status = 'reject' THEN 1 ELSE 0 END) as rejected,
                         SUM(CASE WHEN expert_review_status IS NULL OR expert_review_status = 'pending' THEN 1 ELSE 0 END) as pending,
-                        ROUND(AVG(confidence), 1) as avg_confidence
+                        ROUND(AVG(confidence)::numeric, 1) as avg_confidence
                     FROM diagnosis_history
                 """)
                 stats_row = cur.fetchone()
@@ -4704,7 +4704,6 @@ def register_user_routes(app):
                     """, (crop, disease['disease_code']))
                     sample = cur.fetchone()
                     if sample:
-                        # Create URL to serve the image
                         if sample['image_path']:
                             disease['sample_image'] = url_for('static', filename=sample['image_path'])
                         else:
