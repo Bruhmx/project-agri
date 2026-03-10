@@ -1,0 +1,5 @@
+mkdir -p static/uploads/feedback
+mkdir -p static/uploads/profiles
+touch static/uploads/.gitkeep
+touch static/uploads/feedback/.gitkeep
+touch static/uploads/profiles/.gitkeep
