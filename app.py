@@ -39,9 +39,6 @@ def allowed_file(filename):
 def save_initial_diagnosis(user_id, image_file, crop, disease_data):
     """Save initial AI diagnosis to database with image path"""
     try:
-        db = get_db()
-        cursor = db.cursor()
-
         # Generate unique filename
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         original_filename = secure_filename(image_file.filename)
@@ -62,39 +59,36 @@ def save_initial_diagnosis(user_id, image_file, crop, disease_data):
         image_file.save(file_path)
         print(f"✅ Image saved to disk: {file_path}")
 
-        # IMPORTANT: Store the path in database - use the filename only
-        # Since UPLOAD_FOLDER is 'static/uploads', we store just the filename
-        db_image_path = new_filename  # This will be stored in the image_path column
+        # Store the filename only in database
+        db_image_path = new_filename
 
         # Combine treatment info into recommendations
         recommendations = f"Manual: {disease_data.get('manual_treatment', 'N/A')}. "
         recommendations += f"Organic: {disease_data.get('organic_treatment', 'N/A')}. "
         recommendations += f"Chemical: {disease_data.get('chemical_treatment', 'N/A')}."
 
-        # Insert with image PATH - Using RETURNING for PostgreSQL
-        query = """
-        INSERT INTO diagnosis_history 
-        (user_id, image_path, crop, disease_detected, 
-         confidence, symptoms, recommendations, for_training)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        RETURNING id
-        """
-        values = (
-            user_id,
-            db_image_path,  # Store the filename
-            crop,
-            disease_data['name'],
-            disease_data['confidence'],
-            disease_data.get('symptoms', ''),
-            recommendations,
-            True  # for_training
-        )
+        # Use context manager for database operation
+        with get_db_cursor() as cursor:
+            query = """
+            INSERT INTO diagnosis_history 
+            (user_id, image_path, crop, disease_detected, 
+             confidence, symptoms, recommendations, for_training)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+            """
+            values = (
+                user_id,
+                db_image_path,
+                crop,
+                disease_data['name'],
+                disease_data['confidence'],
+                disease_data.get('symptoms', ''),
+                recommendations,
+                True
+            )
 
-        cursor.execute(query, values)
-        diagnosis_id = cursor.fetchone()[0]  # PostgreSQL way to get ID
-        db.commit()
-        cursor.close()
-        db.close()
+            cursor.execute(query, values)
+            diagnosis_id = cursor.fetchone()[0]
 
         file_size = os.path.getsize(file_path)
         print(f"✅ Diagnosis saved with ID: {diagnosis_id}")
@@ -159,31 +153,27 @@ def diagnosis_image(diagnosis_id):
     is_admin = session.get('is_admin', False)
 
     try:
-        db = get_db()
-        cur = db.cursor()
+        # Use context manager for readonly operation
+        with get_db_cursor_readonly() as cursor:
+            if is_admin:
+                cursor.execute("SELECT image_path FROM diagnosis_history WHERE id = %s", (diagnosis_id,))
+            else:
+                cursor.execute("SELECT image_path FROM diagnosis_history WHERE id = %s AND user_id = %s",
+                            (diagnosis_id, user_id))
 
-        # Admins can view any image, regular users only their own
-        if is_admin:
-            cur.execute("SELECT image_path FROM diagnosis_history WHERE id = %s", (diagnosis_id,))
-        else:
-            cur.execute("SELECT image_path FROM diagnosis_history WHERE id = %s AND user_id = %s",
-                        (diagnosis_id, user_id))
+            result = cursor.fetchone()
 
-        result = cur.fetchone()
-        cur.close()
-        db.close()
-
-        if result and result[0]:
-            image_path = result[0]
+        if result and result['image_path']:
+            image_path = result['image_path']
             print(f"Image path from DB: '{image_path}'")
 
             # Get app directory
             app_dir = os.path.dirname(os.path.abspath(__file__))
 
-            # Get just the filename (remove any path prefixes)
+            # Get just the filename
             filename = os.path.basename(image_path)
 
-            # Always look in static/uploads/ folder
+            # Look in static/uploads/ folder
             full_path = os.path.join(app_dir, 'static', 'uploads', filename)
 
             print(f"Looking for image at: {full_path}")
@@ -193,29 +183,27 @@ def diagnosis_image(diagnosis_id):
 
                 # Determine mimetype
                 ext = os.path.splitext(full_path)[1].lower()
-                if ext == '.jpg' or ext == '.jpeg':
-                    mimetype = 'image/jpeg'
-                elif ext == '.png':
-                    mimetype = 'image/png'
-                elif ext == '.gif':
-                    mimetype = 'image/gif'
-                elif ext == '.webp':
-                    mimetype = 'image/webp'
-                else:
-                    mimetype = 'image/jpeg'
+                mimetypes = {
+                    '.jpg': 'image/jpeg',
+                    '.jpeg': 'image/jpeg',
+                    '.png': 'image/png',
+                    '.gif': 'image/gif',
+                    '.webp': 'image/webp'
+                }
+                mimetype = mimetypes.get(ext, 'image/jpeg')
 
                 return send_file(full_path, mimetype=mimetype)
             else:
                 print(f"❌ File does not exist at: {full_path}")
 
         print(f"❌ No image found for diagnosis {diagnosis_id}")
-        return "Image not found", 404
+        return send_placeholder_image()
 
     except Exception as e:
         print(f"Error in diagnosis_image: {e}")
         import traceback
         traceback.print_exc()
-        return "Error loading image", 500
+        return send_placeholder_image()
 
 def send_placeholder_image():
     """Helper function to send a placeholder image"""
@@ -230,24 +218,21 @@ def send_placeholder_image():
         if os.path.exists(path):
             return send_file(path, mimetype='image/jpeg')
 
-    # If no placeholder found, create a simple colored image on the fly
+    # If no placeholder found, create a simple colored image
     try:
         from PIL import Image, ImageDraw
         import io
 
-        # Create a simple image
         img = Image.new('RGB', (400, 300), color='#f0f0f0')
         d = ImageDraw.Draw(img)
         d.text((150, 150), "No Image Available", fill='#999999')
 
-        # Save to bytes
         img_io = io.BytesIO()
         img.save(img_io, 'JPEG', quality=85)
         img_io.seek(0)
 
         return send_file(img_io, mimetype='image/jpeg')
     except ImportError:
-        # If PIL is not available, return a 404
         return "Image not found", 404
 
 
@@ -255,11 +240,9 @@ def send_placeholder_image():
 
 @app.route("/debug-env")
 def debug_environment():
-    """Debug endpoint to check environment variables (REMOVE AFTER TESTING)"""
-    # Get database URL (mask password for security)
+    """Debug endpoint to check environment variables"""
     db_url = os.environ.get('DATABASE_URL', 'Not set')
     if db_url != 'Not set':
-        # Mask the password part for display
         masked_url = re.sub(r':([^@]+)@', ':****@', db_url)
     else:
         masked_url = 'Not set'
@@ -281,22 +264,15 @@ def debug_environment():
 def test_db_connection():
     """Test if we can connect to the PostgreSQL database"""
     try:
-        # Try to get a connection
-        conn = get_db()
-        cur = conn.cursor()
-        
-        # Test query
-        cur.execute("SELECT current_database(), current_user, version();")
-        result = cur.fetchone()
-        
-        cur.close()
-        return_db(conn)
+        with get_db_cursor_readonly() as cursor:
+            cursor.execute("SELECT current_database(), current_user, version();")
+            result = cursor.fetchone()
         
         return jsonify({
             "success": True,
             "database": result[0],
             "user": result[1],
-            "version": result[2][:50] + "...",  # Truncate
+            "version": result[2][:50] + "...",
             "message": "✅ Successfully connected to PostgreSQL!"
         })
     except Exception as e:
@@ -310,7 +286,6 @@ def test_db_connection():
 @app.route("/init-db")
 def init_database_route():
     """One-time route to initialize database tables"""
-    # Security: Simple secret check
     secret = request.args.get('secret')
     expected_secret = os.environ.get('INIT_SECRET', 'agriaid-init-2024')
     
@@ -354,7 +329,6 @@ def check_tables():
             """)
             tables = cursor.fetchall()
             
-            # Get row counts for each table
             table_stats = []
             for table in tables:
                 table_name = table['table_name']
@@ -381,7 +355,6 @@ def check_tables():
 def health_check():
     """Health check endpoint for Render"""
     try:
-        # Quick database check
         with get_db_cursor_readonly() as cursor:
             cursor.execute("SELECT 1 as health_check")
             result = cursor.fetchone()
@@ -399,12 +372,11 @@ def health_check():
         }), 500
 
 
-# ========== YOUR EXISTING ROUTES ==========
+# ========== MAIN ROUTES ==========
 
 @app.route("/")
 def index():
     """Home page with system description"""
-    # Only clear diagnosis data if needed
     diagnosis_keys = [
         'crop', 'crop_display', 'crop_confidence',
         'diseases', 'question_tree', 'all_questions_flat',
@@ -422,7 +394,6 @@ def index():
 def upload_image():
     """Handle image upload and show AI diagnosis results"""
     if request.method == "POST":
-        # Check if file was uploaded
         if 'image' not in request.files:
             return render_template("upload.html", error="No file selected")
 
@@ -434,7 +405,6 @@ def upload_image():
         if not allowed_file(file.filename):
             return render_template("upload.html", error="File type not allowed. Please upload an image.")
 
-        # Store file position for later use
         file.seek(0)
 
         # Create a temporary file for AI processing
@@ -461,14 +431,11 @@ def upload_image():
             session['crop'] = crop
             session['crop_display'] = get_crop_display_name(crop)
 
-            # Get disease details from database for all detected diseases
+            # Get disease details from database
             disease_results = []
             
-            # Use context manager for database operations
             with get_db_cursor() as cur:
-                # Prepare results for all top diseases
                 for disease_name, confidence in diseases[:3]:
-                    # Get disease information
                     cur.execute("""
                         SELECT * FROM disease_info 
                         WHERE crop = %s AND disease_code = %s
@@ -476,7 +443,6 @@ def upload_image():
 
                     disease_details = cur.fetchone()
 
-                    # Get sample images
                     cur.execute("""
                         SELECT id, image_title as title, 
                                image_description as description, severity_level as severity
@@ -486,7 +452,6 @@ def upload_image():
                     """, (crop, disease_name))
 
                     sample_images = cur.fetchall()
-                    # Generate URLs for each sample
                     for sample in sample_images:
                         sample['url'] = url_for('get_disease_sample_image', sample_id=sample['id'])
 
@@ -507,14 +472,13 @@ def upload_image():
             # ===== SAVE TO DATABASE WITH IMAGE =====
             user_id = session.get('user_id')
             if user_id and disease_results:
-                # Go back to beginning of file for reading
                 file.seek(0)
 
                 diagnosis_id = save_initial_diagnosis(
                     user_id=user_id,
-                    image_file=file,  # Pass the file object directly
+                    image_file=file,
                     crop=crop,
-                    disease_data=disease_results[0]  # Primary disease
+                    disease_data=disease_results[0]
                 )
 
                 if diagnosis_id:
@@ -535,7 +499,6 @@ def upload_image():
                 'crop': session['crop_display']
             }
 
-            # Render results page with AI diagnosis
             return render_template("ai_results.html",
                                    diagnosis=session['ai_diagnosis'],
                                    diagnosis_id=session.get('current_diagnosis_id', 0))
@@ -544,7 +507,6 @@ def upload_image():
             print(f"Error: {e}")
             import traceback
             traceback.print_exc()
-            # Clean up temp file if it exists
             if os.path.exists(temp_filepath):
                 os.remove(temp_filepath)
             return render_template("upload.html", error="Error processing image. Please try again.")
@@ -740,19 +702,25 @@ def get_question_insights():
 @app.route('/my-diagnoses')
 @login_required
 def my_diagnoses():
+    """Display user's diagnosis history"""
     user_id = session['user_id']
     
-    with get_db_cursor() as cur:
-        cur.execute("""
-            SELECT id, image_path, crop, disease_detected, confidence, created_at 
-            FROM diagnosis_history
-            WHERE user_id = %s 
-            ORDER BY created_at DESC
-        """, (user_id,))
+    try:
+        with get_db_cursor() as cur:
+            cur.execute("""
+                SELECT id, image_path, crop, disease_detected, confidence, created_at 
+                FROM diagnosis_history
+                WHERE user_id = %s 
+                ORDER BY created_at DESC
+            """, (user_id,))
 
-        diagnoses = cur.fetchall()
-
-    return render_template('history.html', diagnoses=diagnoses)
+            diagnoses = cur.fetchall()
+            
+        return render_template('history.html', diagnoses=diagnoses)
+    except Exception as e:
+        print(f"Error in my_diagnoses: {e}")
+        flash('Error loading diagnosis history', 'danger')
+        return render_template('history.html', diagnoses=[])
 
 
 @app.route("/export-training-data", methods=["POST"])
