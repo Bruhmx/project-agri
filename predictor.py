@@ -9,7 +9,7 @@ warnings.filterwarnings('ignore')
 
 print("=" * 50)
 print(f"TensorFlow version: {tf.__version__}")
-print(f"Keras version: {tf.keras.__version__}")  # Fixed: double underscores, not _version_
+# Removed the Keras version line that was causing issues
 print("=" * 50)
 
 def load_model_safely(model_path, model_name):
@@ -22,26 +22,45 @@ def load_model_safely(model_path, model_name):
             print(f"  Found .h5 alternative: {h5_path}")
             model_path = h5_path
         else:
-            return None
+            # Try looking for SavedModel format
+            saved_model_path = model_path.replace('.keras', '_savedmodel')
+            if os.path.exists(saved_model_path):
+                print(f"  Found SavedModel alternative: {saved_model_path}")
+                model_path = saved_model_path
+            else:
+                return None
     
     print(f"\nAttempting to load {model_name} from {os.path.basename(model_path)}...")
     
-    try:
-        # TF 2.15.0 handles Functional class better
-        model = tf.keras.models.load_model(model_path)
-        print(f"✅ {model_name} loaded successfully!")
-        return model
-    except Exception as e:
-        print(f"  Standard loading failed: {type(e).__name__}")
+    # Try multiple loading methods
+    methods = [
+        # Method 1: Standard loading
+        lambda: tf.keras.models.load_model(model_path),
         
+        # Method 2: Load with compile=False
+        lambda: tf.keras.models.load_model(model_path, compile=False),
+        
+        # Method 3: Load with custom objects
+        lambda: tf.keras.models.load_model(
+            model_path, 
+            custom_objects={'Functional': tf.keras.Model}
+        ),
+        
+        # Method 4: Try as SavedModel
+        lambda: tf.saved_model.load(model_path)
+    ]
+    
+    for i, method in enumerate(methods, 1):
         try:
-            # Try with compile=False
-            model = tf.keras.models.load_model(model_path, compile=False)
-            print(f"✅ {model_name} loaded with compile=False")
+            model = method()
+            print(f"✅ {model_name} loaded successfully (method {i})!")
             return model
-        except Exception as e2:
-            print(f"  All loading methods failed: {type(e2).__name__}")
-            return None
+        except Exception as e:
+            print(f"  Method {i} failed: {type(e).__name__}")
+            continue
+    
+    print(f"  All loading methods failed for {model_name}")
+    return None
 
 # Get the directory where this script is located
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -53,8 +72,11 @@ if os.path.exists(MODELS_DIR):
     print("\n📋 Available model files:")
     for f in os.listdir(MODELS_DIR):
         file_path = os.path.join(MODELS_DIR, f)
-        size_kb = os.path.getsize(file_path) / 1024
-        print(f"  - {f} ({size_kb:.1f} KB)")
+        if os.path.isfile(file_path):
+            size_kb = os.path.getsize(file_path) / 1024
+            print(f"  - {f} ({size_kb:.1f} KB)")
+        else:
+            print(f"  - {f}/ (directory)")
 else:
     print(f"⚠️ Models directory not found at: {MODELS_DIR}")
     os.makedirs(MODELS_DIR, exist_ok=True)
@@ -228,6 +250,10 @@ def get_model_info():
         'corn_model': 'Loaded' if corn_model is not None else 'Not loaded',
         'rice_model': 'Loaded' if rice_model is not None else 'Not loaded',
         'tensorflow_version': tf.__version__,
-        'keras_version': tf.keras.__version__
     }
+    # Safely try to get keras version
+    try:
+        info['keras_version'] = tf.keras.__version__
+    except:
+        info['keras_version'] = 'Unknown'
     return info
