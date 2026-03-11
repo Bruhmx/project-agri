@@ -7,76 +7,78 @@ import glob
 
 warnings.filterwarnings('ignore')
 
-# Function to load model with compatibility fixes for TF 2.13.0
+print("=" * 50)
+print(f"TensorFlow version: {tf.__version__}")
+print(f"Keras version: {tf.keras.__version__}")
+print("=" * 50)
+
 def load_model_safely(model_path, model_name):
-    """Load a Keras model with compatibility fixes for TF 2.13.0"""
+    """Load a Keras model with compatibility for TF 2.15.0"""
     if not os.path.exists(model_path):
         print(f"⚠️ Model file not found: {model_path}")
-        return None
+        # Try looking for .h5 version
+        h5_path = model_path.replace('.keras', '.h5')
+        if os.path.exists(h5_path):
+            print(f"  Found .h5 alternative: {h5_path}")
+            model_path = h5_path
+        else:
+            return None
     
-    print(f"Attempting to load {model_name} from {model_path}...")
+    print(f"\nAttempting to load {model_name} from {os.path.basename(model_path)}...")
     
-    # Method 1: Standard loading for TF 2.13.0
     try:
+        # TF 2.15.0 handles Functional class better
         model = tf.keras.models.load_model(model_path)
-        print(f"✓ {model_name} loaded successfully")
+        print(f"✅ {model_name} loaded successfully!")
         return model
     except Exception as e:
-        print(f"  Standard loading failed: {type(e).__name__} - {str(e)[:100]}")
+        print(f"  Standard loading failed: {type(e).__name__}")
         
-        # Method 2: Load with custom objects for TF 2.13.0
         try:
-            model = tf.keras.models.load_model(
-                model_path,
-                custom_objects={
-                    'Functional': tf.keras.Model,
-                }
-            )
-            print(f"✓ {model_name} loaded with custom objects")
+            # Try with compile=False
+            model = tf.keras.models.load_model(model_path, compile=False)
+            print(f"✅ {model_name} loaded with compile=False")
             return model
         except Exception as e2:
-            print(f"  Custom objects loading failed: {type(e2).__name__}")
-            
-            # Method 3: Load with compile=False
-            try:
-                model = tf.keras.models.load_model(
-                    model_path,
-                    compile=False
-                )
-                print(f"✓ {model_name} loaded with compile=False")
-                return model
-            except Exception as e3:
-                print(f"  All loading methods failed: {type(e3).__name__}")
-    
-    return None
+            print(f"  All loading methods failed: {type(e2).__name__}")
+            return None
 
 # Get the directory where this script is located
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 
-print("=" * 50)
-print("Loading ML Models with TensorFlow", tf.__version__)
+print("\n📁 Checking models directory...")
+if os.path.exists(MODELS_DIR):
+    print(f"✅ Models directory found: {MODELS_DIR}")
+    print("\n📋 Available model files:")
+    for f in os.listdir(MODELS_DIR):
+        file_path = os.path.join(MODELS_DIR, f)
+        size_kb = os.path.getsize(file_path) / 1024
+        print(f"  - {f} ({size_kb:.1f} KB)")
+else:
+    print(f"⚠️ Models directory not found at: {MODELS_DIR}")
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    print(f"✅ Created models directory")
+
+print("\n" + "=" * 50)
+print("🚀 LOADING MODELS...")
 print("=" * 50)
 
-# Create models directory if it doesn't exist
-os.makedirs(MODELS_DIR, exist_ok=True)
-
-# Load models with safe method
+# Load models
 crop_model = load_model_safely(os.path.join(MODELS_DIR, "crop_model_final.keras"), "Crop Model")
 corn_model = load_model_safely(os.path.join(MODELS_DIR, "corn_model_final.keras"), "Corn Disease Model")
 rice_model = load_model_safely(os.path.join(MODELS_DIR, "rice_model_final.keras"), "Rice Disease Model")
 
-print("=" * 50)
-if crop_model is not None and corn_model is not None and rice_model is not None:
-    print("✓ All models loaded successfully!")
+print("\n" + "=" * 50)
+print("📊 MODEL STATUS:")
+print(f"  Crop Model: {'✅ LOADED' if crop_model is not None else '❌ NOT LOADED'}")
+print(f"  Corn Model: {'✅ LOADED' if corn_model is not None else '❌ NOT LOADED'}")
+print(f"  Rice Model: {'✅ LOADED' if rice_model is not None else '❌ NOT LOADED'}")
+
+if crop_model and corn_model and rice_model:
+    print("\n✨ All models loaded successfully! Ready for predictions.")
 else:
-    print("⚠️ Some models failed to load - using fallback predictions")
-    if crop_model is None:
-        print("  - Crop model: NOT LOADED")
-    if corn_model is None:
-        print("  - Corn model: NOT LOADED")
-    if rice_model is None:
-        print("  - Rice model: NOT LOADED")
+    print("\n⚠️ Some models failed to load - using fallback predictions")
 print("=" * 50)
 
 # Class mappings with display names
@@ -193,28 +195,21 @@ def get_disease_display_name(disease_code):
 
 def get_sample_images(disease_code, crop):
     """Return local sample image paths for the diagnosed disease"""
-    # Clean disease code for folder names
     clean_disease_code = disease_code.replace(' ', '_')
-
-    # Define the sample images directory
     base_dir = os.path.join('static', 'samples')
     sample_dir = os.path.join(base_dir, crop, clean_disease_code)
 
-    # Check if directory exists
     if os.path.exists(sample_dir):
-        # Get all image files from the directory
         image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.gif', '*.webp']
         image_files = []
 
         for ext in image_extensions:
             image_files.extend(glob.glob(os.path.join(sample_dir, ext)))
 
-        # Sort files to maintain consistency
         image_files.sort()
 
-        # Convert to URL paths
         sample_urls = []
-        for img_path in image_files[:4]:  # Get max 4 images
+        for img_path in image_files[:4]:
             rel_path = img_path.replace('\\', '/')
             if not rel_path.startswith('/'):
                 rel_path = '/' + rel_path
@@ -223,7 +218,6 @@ def get_sample_images(disease_code, crop):
         if sample_urls:
             return sample_urls
 
-    # Return empty list if no images found
     return []
 
 
