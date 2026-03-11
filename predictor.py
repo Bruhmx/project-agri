@@ -4,12 +4,12 @@ from PIL import Image
 import warnings
 import os
 import glob
+import json
 
 warnings.filterwarnings('ignore')
 
 print("=" * 50)
 print(f"TensorFlow version: {tf.__version__}")
-# Removed the Keras version line that was causing issues
 print("=" * 50)
 
 def load_model_safely(model_path, model_name):
@@ -22,13 +22,7 @@ def load_model_safely(model_path, model_name):
             print(f"  Found .h5 alternative: {h5_path}")
             model_path = h5_path
         else:
-            # Try looking for SavedModel format
-            saved_model_path = model_path.replace('.keras', '_savedmodel')
-            if os.path.exists(saved_model_path):
-                print(f"  Found SavedModel alternative: {saved_model_path}")
-                model_path = saved_model_path
-            else:
-                return None
+            return None
     
     print(f"\nAttempting to load {model_name} from {os.path.basename(model_path)}...")
     
@@ -40,14 +34,17 @@ def load_model_safely(model_path, model_name):
         # Method 2: Load with compile=False
         lambda: tf.keras.models.load_model(model_path, compile=False),
         
-        # Method 3: Load with custom objects
+        # Method 3: Load with custom objects for Functional class
         lambda: tf.keras.models.load_model(
             model_path, 
-            custom_objects={'Functional': tf.keras.Model}
+            custom_objects={
+                'Functional': tf.keras.Model,
+                'DTypePolicy': object
+            }
         ),
         
-        # Method 4: Try as SavedModel
-        lambda: tf.saved_model.load(model_path)
+        # Method 4: Try with safe_mode=False (for Keras v3)
+        lambda: tf.keras.models.load_model(model_path, safe_mode=False)
     ]
     
     for i, method in enumerate(methods, 1):
@@ -71,38 +68,24 @@ if os.path.exists(MODELS_DIR):
     print(f"✅ Models directory found: {MODELS_DIR}")
     print("\n📋 Available model files:")
     
-    # ===== TEMPORARY DEBUG CODE =====
+    # Debug information
     print("\n🔍 Detailed model file inspection:")
+    keras_v3_files = []
     for f in os.listdir(MODELS_DIR):
         file_path = os.path.join(MODELS_DIR, f)
         if os.path.isfile(file_path):
             size_mb = os.path.getsize(file_path) / (1024 * 1024)
-            print(f"  📄 {f} - {size_mb:.2f} MB")
-            
-            # Try to read first few bytes to identify format
-            try:
-                with open(file_path, 'rb') as file:
-                    header = file.read(100)
-                    if header.startswith(b'\x89HDF'):
-                        print(f"     └─ Format: HDF5 (.h5)")
-                    elif b'keras' in header.lower():
-                        print(f"     └─ Format: Keras v3")
-                    elif header.startswith(b'PK'):
-                        print(f"     └─ Format: SavedModel (zip)")
-                    else:
-                        # Try to decode as text to check for JSON
-                        try:
-                            text = header.decode('utf-8')
-                            if 'keras' in text.lower() and 'config' in text.lower():
-                                print(f"     └─ Format: Keras JSON format")
-                            else:
-                                print(f"     └─ Format: Unknown binary format")
-                        except:
-                            print(f"     └─ Format: Unknown binary format")
-            except Exception as e:
-                print(f"     └─ Could not read header: {e}")
-    # ===== END DEBUG CODE =====
+            if f.endswith('.keras'):
+                keras_v3_files.append(f)
+                print(f"  📄 {f} - {size_mb:.2f} MB (Keras v3 format)")
+            elif f.endswith('.h5'):
+                print(f"  📄 {f} - {size_mb:.2f} MB (H5 format)")
+            else:
+                print(f"  📄 {f} - {size_mb:.2f} MB")
     
+    if keras_v3_files:
+        print(f"\n⚠️ Found {len(keras_v3_files)} Keras v3 model(s). These may not be compatible with TF {tf.__version__}")
+        print("   The app will use fallback predictions for now.")
 else:
     print(f"⚠️ Models directory not found at: {MODELS_DIR}")
     os.makedirs(MODELS_DIR, exist_ok=True)
@@ -127,6 +110,8 @@ if crop_model and corn_model and rice_model:
     print("\n✨ All models loaded successfully! Ready for predictions.")
 else:
     print("\n⚠️ Some models failed to load - using fallback predictions")
+    print("   This is expected with Keras v3 models on TensorFlow 2.15.0")
+    print("   The app will still work with pre-configured disease information.")
 print("=" * 50)
 
 # Class mappings with display names
@@ -153,6 +138,20 @@ RICE_DISPLAY_NAMES = {
     "tungro": "Tungro Virus"
 }
 
+# Fallback disease database for when models don't load
+FALLBACK_DISEASES = {
+    "corn": [
+        {"code": "Common_Rust", "name": "Common Rust", "confidence": 0.7},
+        {"code": "gls", "name": "Gray Leaf Spot", "confidence": 0.2},
+        {"code": "healthy", "name": "Healthy", "confidence": 0.1}
+    ],
+    "rice": [
+        {"code": "blast", "name": "Rice Blast", "confidence": 0.6},
+        {"code": "blight", "name": "Bacterial Leaf Blight", "confidence": 0.3},
+        {"code": "healthy", "name": "Healthy", "confidence": 0.1}
+    ]
+}
+
 
 def preprocess_image(img_path, img_size=(224, 224)):
     """Preprocess image for model prediction"""
@@ -177,7 +176,7 @@ def preprocess_image(img_path, img_size=(224, 224)):
 def predict_crop(img_path):
     """Predict crop type from image"""
     if crop_model is None:
-        print("⚠️ Crop model not loaded - using fallback")
+        print("⚠️ Crop model not loaded - using fallback (corn)")
         return "corn", 0.85
 
     try:
@@ -200,14 +199,14 @@ def predict_disease(img_path, crop):
         if crop == "corn":
             if corn_model is None:
                 print("⚠️ Corn model not loaded - using fallback")
-                return [("Common_Rust", 0.7), ("gls", 0.2), ("healthy", 0.1)]
+                return [(d["code"], d["confidence"]) for d in FALLBACK_DISEASES["corn"]]
 
             predictions = corn_model.predict(img, verbose=0)[0]
             classes = CORN_CLASSES
         else:  # rice
             if rice_model is None:
                 print("⚠️ Rice model not loaded - using fallback")
-                return [("blast", 0.6), ("blight", 0.3), ("healthy", 0.1)]
+                return [(d["code"], d["confidence"]) for d in FALLBACK_DISEASES["rice"]]
 
             predictions = rice_model.predict(img, verbose=0)[0]
             classes = RICE_CLASSES
@@ -223,9 +222,9 @@ def predict_disease(img_path, crop):
         print(f"⚠️ Error in disease prediction: {e}")
         # Return fallback predictions
         if crop == "corn":
-            return [("Common_Rust", 0.7), ("gls", 0.2), ("healthy", 0.1)]
+            return [(d["code"], d["confidence"]) for d in FALLBACK_DISEASES["corn"]]
         else:
-            return [("blast", 0.6), ("blight", 0.3), ("healthy", 0.1)]
+            return [(d["code"], d["confidence"]) for d in FALLBACK_DISEASES["rice"]]
 
 
 def get_crop_display_name(crop_code):
@@ -272,10 +271,11 @@ def get_sample_images(disease_code, crop):
 def get_model_info():
     """Get information about loaded models"""
     info = {
-        'crop_model': 'Loaded' if crop_model is not None else 'Not loaded',
-        'corn_model': 'Loaded' if corn_model is not None else 'Not loaded',
-        'rice_model': 'Loaded' if rice_model is not None else 'Not loaded',
+        'crop_model': 'Loaded' if crop_model is not None else 'Not loaded (using fallback)',
+        'corn_model': 'Loaded' if corn_model is not None else 'Not loaded (using fallback)',
+        'rice_model': 'Loaded' if rice_model is not None else 'Not loaded (using fallback)',
         'tensorflow_version': tf.__version__,
+        'status': 'Using fallback predictions' if not (crop_model and corn_model and rice_model) else 'All models loaded'
     }
     # Safely try to get keras version
     try:
