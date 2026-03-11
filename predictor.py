@@ -9,7 +9,7 @@ warnings.filterwarnings('ignore')
 
 print("=" * 50)
 print(f"TensorFlow version: {tf.__version__}")
-print(f"Keras version: {tf.keras.__version__}")
+print(f"Keras version: {tf.keras.__version__}")  # Fixed: double underscores, not _version_
 print("=" * 50)
 
 def load_model_safely(model_path, model_name):
