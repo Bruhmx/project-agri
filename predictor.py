@@ -70,13 +70,39 @@ print("\n📁 Checking models directory...")
 if os.path.exists(MODELS_DIR):
     print(f"✅ Models directory found: {MODELS_DIR}")
     print("\n📋 Available model files:")
+    
+    # ===== TEMPORARY DEBUG CODE =====
+    print("\n🔍 Detailed model file inspection:")
     for f in os.listdir(MODELS_DIR):
         file_path = os.path.join(MODELS_DIR, f)
         if os.path.isfile(file_path):
-            size_kb = os.path.getsize(file_path) / 1024
-            print(f"  - {f} ({size_kb:.1f} KB)")
-        else:
-            print(f"  - {f}/ (directory)")
+            size_mb = os.path.getsize(file_path) / (1024 * 1024)
+            print(f"  📄 {f} - {size_mb:.2f} MB")
+            
+            # Try to read first few bytes to identify format
+            try:
+                with open(file_path, 'rb') as file:
+                    header = file.read(100)
+                    if header.startswith(b'\x89HDF'):
+                        print(f"     └─ Format: HDF5 (.h5)")
+                    elif b'keras' in header.lower():
+                        print(f"     └─ Format: Keras v3")
+                    elif header.startswith(b'PK'):
+                        print(f"     └─ Format: SavedModel (zip)")
+                    else:
+                        # Try to decode as text to check for JSON
+                        try:
+                            text = header.decode('utf-8')
+                            if 'keras' in text.lower() and 'config' in text.lower():
+                                print(f"     └─ Format: Keras JSON format")
+                            else:
+                                print(f"     └─ Format: Unknown binary format")
+                        except:
+                            print(f"     └─ Format: Unknown binary format")
+            except Exception as e:
+                print(f"     └─ Could not read header: {e}")
+    # ===== END DEBUG CODE =====
+    
 else:
     print(f"⚠️ Models directory not found at: {MODELS_DIR}")
     os.makedirs(MODELS_DIR, exist_ok=True)
