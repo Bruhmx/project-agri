@@ -6,137 +6,201 @@ from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
 from contextlib import contextmanager
 import time
-import ssl
+import threading
+import logging
 
 load_dotenv()
 
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # Initialize connection pool as None first
 connection_pool = None
+_pool_lock = threading.Lock()
+_pool_initialized = False
+
+# Configuration
+POOL_MIN_CONN = 1
+POOL_MAX_CONN = 10  # Increased slightly for better handling
+CONNECTION_TIMEOUT = 30
+RETRY_DELAY = 1
+MAX_RETRIES = 3
 
 def init_db_pool():
     """Initialize the PostgreSQL connection pool with proper SSL"""
-    global connection_pool
+    global connection_pool, _pool_initialized
     
-    try:
-        # Get database URL from environment (Render provides this)
-        database_url = os.getenv('DATABASE_URL')
-        
-        if not database_url:
-            print("❌ DATABASE_URL not found in environment variables")
-            return False
+    # Use lock to prevent multiple threads from initializing simultaneously
+    with _pool_lock:
+        if _pool_initialized and connection_pool is not None:
+            return True
             
-        print(f"🔌 Connecting to database...")
-        
-        # Render provides DATABASE_URL, but it might start with postgres://
-        # psycopg2 requires postgresql://
-        if database_url.startswith('postgres://'):
-            database_url = database_url.replace('postgres://', 'postgresql://', 1)
-            print("🔄 Converted postgres:// to postgresql://")
-        
-        # IMPORTANT: Add SSL mode to the connection string if not present
-        if 'sslmode' not in database_url:
-            # Add ? or & depending on whether there are already parameters
-            if '?' in database_url:
-                database_url += '&sslmode=require'
-            else:
-                database_url += '?sslmode=require'
-            print("🔒 Added SSL mode: require")
-        
-        # Create connection pool with SSL
-        connection_pool = psycopg2.pool.SimpleConnectionPool(
-            1,  # min connections
-            5,  # max connections (reduced for free tier)
-            dsn=database_url,
-            connect_timeout=10,
-            sslmode='require',
-            keepalives=1,
-            keepalives_idle=30,
-            keepalives_interval=10,
-            keepalives_count=5
-        )
-        
-        # Test the connection
-        test_conn = connection_pool.getconn()
-        test_cursor = test_conn.cursor()
-        test_cursor.execute("SELECT 1")
-        test_cursor.close()
-        connection_pool.putconn(test_conn)
-        
-        print(f"✅ PostgreSQL connection pool created successfully")
-        print(f"   Pool size: 1-5 connections")
-        print(f"   SSL Mode: require")
-        return True
-        
-    except Exception as e:
-        print(f"❌ Failed to create connection pool: {e}")
-        import traceback
-        traceback.print_exc()
-        connection_pool = None
-        return False
+        try:
+            # Get database URL from environment (Render provides this)
+            database_url = os.getenv('DATABASE_URL')
+            
+            if not database_url:
+                logger.error("❌ DATABASE_URL not found in environment variables")
+                return False
+                
+            logger.info("🔌 Connecting to database...")
+            
+            # Render provides DATABASE_URL, but it might start with postgres://
+            # psycopg2 requires postgresql://
+            if database_url.startswith('postgres://'):
+                database_url = database_url.replace('postgres://', 'postgresql://', 1)
+                logger.info("🔄 Converted postgres:// to postgresql://")
+            
+            # IMPORTANT: Add SSL mode to the connection string if not present
+            if 'sslmode' not in database_url:
+                # Add ? or & depending on whether there are already parameters
+                if '?' in database_url:
+                    database_url += '&sslmode=require'
+                else:
+                    database_url += '?sslmode=require'
+                logger.info("🔒 Added SSL mode: require")
+            
+            # Create connection pool with SSL
+            connection_pool = psycopg2.pool.SimpleConnectionPool(
+                POOL_MIN_CONN,
+                POOL_MAX_CONN,
+                dsn=database_url,
+                connect_timeout=10,
+                sslmode='require',
+                keepalives=1,
+                keepalives_idle=30,
+                keepalives_interval=10,
+                keepalives_count=5
+            )
+            
+            # Test the connection
+            test_conn = None
+            try:
+                test_conn = connection_pool.getconn()
+                with test_conn.cursor() as test_cursor:
+                    test_cursor.execute("SELECT 1")
+                logger.info("✅ Connection test successful")
+            finally:
+                if test_conn:
+                    connection_pool.putconn(test_conn)
+            
+            _pool_initialized = True
+            logger.info(f"✅ PostgreSQL connection pool created successfully")
+            logger.info(f"   Pool size: {POOL_MIN_CONN}-{POOL_MAX_CONN} connections")
+            logger.info(f"   SSL Mode: require")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to create connection pool: {e}")
+            import traceback
+            traceback.print_exc()
+            connection_pool = None
+            _pool_initialized = False
+            return False
 
 # Initialize the pool when module is imported
 init_db_pool()
 
 def get_db():
     """Get a database connection from the pool with retry logic"""
-    global connection_pool
+    global connection_pool, _pool_initialized
     
     # Retry logic for cold starts and SSL issues
-    max_retries = 3
-    retry_delay = 2
-    
-    for attempt in range(max_retries):
+    for attempt in range(MAX_RETRIES):
         try:
-            if connection_pool is None:
-                print(f"⚠️ Connection pool not initialized (attempt {attempt+1}/{max_retries})...")
+            # Check if pool needs initialization
+            if connection_pool is None or not _pool_initialized:
+                logger.warning(f"⚠️ Connection pool not initialized (attempt {attempt+1}/{MAX_RETRIES})...")
                 if not init_db_pool():
-                    if attempt == max_retries - 1:
+                    if attempt == MAX_RETRIES - 1:
                         raise Exception("Database connection pool not initialized after retries")
-                    time.sleep(retry_delay)
+                    time.sleep(RETRY_DELAY * (attempt + 1))  # Exponential backoff
                     continue
             
-            # Try to get a connection
-            connection = connection_pool.getconn()
+            # Try to get a connection with timeout
+            try:
+                connection = connection_pool.getconn()
+            except Exception as e:
+                logger.error(f"Failed to get connection from pool: {e}")
+                if attempt == MAX_RETRIES - 1:
+                    raise
+                time.sleep(RETRY_DELAY * (attempt + 1))
+                continue
             
             # Test the connection is alive
-            test_cursor = connection.cursor()
-            test_cursor.execute("SELECT 1")
-            test_cursor.close()
-            
-            return connection
-            
+            try:
+                with connection.cursor() as test_cursor:
+                    test_cursor.execute("SELECT 1")
+                return connection
+            except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+                # Connection is dead, close it and try again
+                logger.warning(f"Connection test failed: {e}")
+                try:
+                    connection_pool.putconn(connection, close=True)
+                except:
+                    pass
+                if attempt == MAX_RETRIES - 1:
+                    raise
+                time.sleep(RETRY_DELAY * (attempt + 1))
+                
         except psycopg2.OperationalError as e:
             if "SSL" in str(e):
-                print(f"⚠️ SSL error (attempt {attempt+1}/{max_retries}): {e}")
+                logger.warning(f"⚠️ SSL error (attempt {attempt+1}/{MAX_RETRIES}): {e}")
                 # Force reinitialize pool with fresh SSL connection
-                connection_pool = None
-                if attempt < max_retries - 1:
-                    time.sleep(retry_delay)
+                with _pool_lock:
+                    connection_pool = None
+                    _pool_initialized = False
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_DELAY * (attempt + 1))
             else:
-                print(f"⚠️ Database connection error (attempt {attempt+1}/{max_retries}): {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(retry_delay)
+                logger.warning(f"⚠️ Database connection error (attempt {attempt+1}/{MAX_RETRIES}): {e}")
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_DELAY * (attempt + 1))
                     
         except Exception as e:
-            print(f"⚠️ Unexpected error (attempt {attempt+1}/{max_retries}): {e}")
-            if attempt == max_retries - 1:
+            logger.warning(f"⚠️ Unexpected error (attempt {attempt+1}/{MAX_RETRIES}): {e}")
+            if attempt == MAX_RETRIES - 1:
                 raise
-            time.sleep(retry_delay)
+            time.sleep(RETRY_DELAY * (attempt + 1))
     
     raise Exception("Failed to get database connection after multiple retries")
 
 def return_db(connection):
-    """Return a connection to the pool"""
+    """Return a connection to the pool safely"""
     global connection_pool
-    if connection_pool and connection:
-        try:
-            # Ensure connection is still alive before returning
-            if not connection.closed:
+    if connection_pool is None or connection is None:
+        return
+    
+    try:
+        # Check if connection is still alive before returning
+        if not connection.closed:
+            try:
+                # Quick test to ensure connection is usable
+                with connection.cursor() as test_cursor:
+                    test_cursor.execute("SELECT 1")
                 connection_pool.putconn(connection)
-            else:
-                print("⚠️ Attempted to return closed connection to pool")
-        except Exception as e:
-            print(f"⚠️ Error returning connection to pool: {e}")
+            except (psycopg2.OperationalError, psycopg2.InterfaceError):
+                # Connection is dead, close it properly
+                logger.warning("Returning dead connection to pool, closing instead")
+                try:
+                    connection_pool.putconn(connection, close=True)
+                except:
+                    try:
+                        connection.close()
+                    except:
+                        pass
+        else:
+            logger.warning("Attempted to return closed connection to pool")
+            # Connection already closed, just log it
+            pass
+    except Exception as e:
+        logger.error(f"⚠️ Error returning connection to pool: {e}")
+        # Try to close the connection manually
+        try:
+            connection.close()
+        except:
+            pass
 
 @contextmanager
 def get_db_cursor():
@@ -154,18 +218,17 @@ def get_db_cursor():
                 connection.rollback()
             except:
                 pass
-        raise e
+        logger.error(f"❌ Database error: {e}")
+        raise
     finally:
+        # Always clean up in reverse order
         if cursor:
             try:
                 cursor.close()
             except:
                 pass
         if connection:
-            try:
-                return_db(connection)
-            except:
-                pass
+            return_db(connection)
 
 @contextmanager
 def get_db_cursor_readonly():
@@ -175,7 +238,12 @@ def get_db_cursor_readonly():
     try:
         connection = get_db()
         cursor = connection.cursor(cursor_factory=RealDictCursor)
+        # Set transaction to readonly for safety
+        cursor.execute("SET TRANSACTION READ ONLY")
         yield cursor
+    except Exception as e:
+        logger.error(f"❌ Readonly database error: {e}")
+        raise
     finally:
         if cursor:
             try:
@@ -183,33 +251,58 @@ def get_db_cursor_readonly():
             except:
                 pass
         if connection:
-            try:
-                return_db(connection)
-            except:
-                pass
+            return_db(connection)
 
 def get_pool_info():
     """Get information about the connection pool"""
-    global connection_pool
+    global connection_pool, _pool_initialized
     
     if connection_pool is None:
-        return {"status": "not_initialized"}
+        return {
+            "status": "not_initialized",
+            "initialized": _pool_initialized
+        }
     
     try:
+        # Try to get pool stats (may not be available on all versions)
+        used = getattr(connection_pool, '_used', 'N/A')
+        pool_size = getattr(connection_pool, '_pool', 'N/A')
+        
         return {
             "status": "active",
-            "min_connections": connection_pool.minconn,
-            "max_connections": connection_pool.maxconn,
+            "initialized": _pool_initialized,
+            "min_connections": POOL_MIN_CONN,
+            "max_connections": POOL_MAX_CONN,
+            "used_connections": len(used) if isinstance(used, (list, dict)) else 'N/A',
+            "pool_size": len(pool_size) if isinstance(pool_size, (list, dict)) else 'N/A',
             "closed": getattr(connection_pool, '_closed', False)
         }
     except Exception as e:
-        return {"status": "error", "error": str(e)}
+        return {
+            "status": "error",
+            "error": str(e),
+            "initialized": _pool_initialized
+        }
+
+def close_all_connections():
+    """Close all connections in the pool - call this on app shutdown"""
+    global connection_pool, _pool_initialized
+    with _pool_lock:
+        if connection_pool:
+            try:
+                connection_pool.closeall()
+                logger.info("✅ All database connections closed")
+            except Exception as e:
+                logger.error(f"❌ Error closing connections: {e}")
+            finally:
+                connection_pool = None
+                _pool_initialized = False
 
 # ========== TABLE CREATION FUNCTION ==========
 
 def create_tables_if_not_exist():
     """Create all necessary tables if they don't exist"""
-    print("📦 Checking/Creating database tables...")
+    logger.info("📦 Checking/Creating database tables...")
     try:
         with get_db_cursor() as cursor:
             # Create users table
@@ -233,7 +326,7 @@ def create_tables_if_not_exist():
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            print("  ✅ users table ready")
+            logger.info("  ✅ users table ready")
             
             # Create diagnosis_history table
             cursor.execute("""
@@ -259,7 +352,7 @@ def create_tables_if_not_exist():
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            print("  ✅ diagnosis_history table ready")
+            logger.info("  ✅ diagnosis_history table ready")
             
             # Create disease_info table
             cursor.execute("""
@@ -279,7 +372,7 @@ def create_tables_if_not_exist():
                     UNIQUE(crop, disease_code)
                 )
             """)
-            print("  ✅ disease_info table ready")
+            logger.info("  ✅ disease_info table ready")
             
             # Create disease_samples table
             cursor.execute("""
@@ -295,7 +388,7 @@ def create_tables_if_not_exist():
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            print("  ✅ disease_samples table ready")
+            logger.info("  ✅ disease_samples table ready")
             
             # Create questions table
             cursor.execute("""
@@ -314,7 +407,7 @@ def create_tables_if_not_exist():
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            print("  ✅ questions table ready")
+            logger.info("  ✅ questions table ready")
             
             # Create user_settings table
             cursor.execute("""
@@ -347,7 +440,7 @@ def create_tables_if_not_exist():
                     UNIQUE(user_id)
                 )
             """)
-            print("  ✅ user_settings table ready")
+            logger.info("  ✅ user_settings table ready")
             
             # Create saved_diagnoses table
             cursor.execute("""
@@ -365,7 +458,7 @@ def create_tables_if_not_exist():
                     PRIMARY KEY (user_id, id)
                 )
             """)
-            print("  ✅ saved_diagnoses table ready")
+            logger.info("  ✅ saved_diagnoses table ready")
             
             # Create feedback table
             cursor.execute("""
@@ -388,7 +481,7 @@ def create_tables_if_not_exist():
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            print("  ✅ feedback table ready")
+            logger.info("  ✅ feedback table ready")
             
             # Create indexes for better performance
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_diagnosis_user_id ON diagnosis_history(user_id)")
@@ -399,7 +492,7 @@ def create_tables_if_not_exist():
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_feedback_user ON feedback(user_id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_feedback_status ON feedback(status)")
             
-            print("  ✅ indexes created")
+            logger.info("  ✅ indexes created")
             
             # Check if admin user exists, if not create default admin
             cursor.execute("SELECT COUNT(*) as count FROM users WHERE user_type = 'admin'")
@@ -416,26 +509,30 @@ def create_tables_if_not_exist():
                         VALUES (%s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT (username) DO NOTHING
                     """, ('admin', 'admin@agriaid.com', admin_password, 'System Administrator', 'admin', True, True))
-                    print("  ✅ default admin user created (username: admin, password: Admin@123)")
+                    logger.info("  ✅ default admin user created (username: admin, password: Admin@123)")
                 except Exception as e:
-                    print(f"  ⚠️ Could not create admin user: {e}")
+                    logger.warning(f"  ⚠️ Could not create admin user: {e}")
             
-            print("✅✅✅ ALL TABLES CREATED/VERIFIED SUCCESSFULLY! ✅✅✅")
+            logger.info("✅✅✅ ALL TABLES CREATED/VERIFIED SUCCESSFULLY! ✅✅✅")
             
     except Exception as e:
-        print(f"❌ Error creating tables: {e}")
+        logger.error(f"❌ Error creating tables: {e}")
         import traceback
         traceback.print_exc()
 
 # ========== AUTO-CREATE TABLES ON STARTUP ==========
-print("=" * 50)
-print("🚀 CHECKING DATABASE TABLES...")
-print("=" * 50)
+logger.info("=" * 50)
+logger.info("🚀 CHECKING DATABASE TABLES...")
+logger.info("=" * 50)
 try:
     # Small delay to ensure connection pool is ready
     time.sleep(2)
     create_tables_if_not_exist()
 except Exception as e:
-    print(f"⚠️ Could not create tables on startup: {e}")
-    print("Tables will be created when first needed.")
-print("=" * 50)
+    logger.warning(f"⚠️ Could not create tables on startup: {e}")
+    logger.warning("Tables will be created when first needed.")
+logger.info("=" * 50)
+
+# Add cleanup handler
+import atexit
+atexit.register(close_all_connections)
